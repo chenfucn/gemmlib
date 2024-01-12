@@ -277,10 +277,14 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
   std::vector<ElementW> packed_w(q_weight_shape.product());
   mickey::MatrixRef<ElementW, LayoutWPack, true> tensor_packed_w(
       packed_w, cutlass::make_Coord(rows, columns / 2));
-  auto err = Base::prepack_weights(rows, columns, o_elements, packed_w);
+  ElementW *packed_w_dev_ptr = nullptr;
+  cudaMalloc(&packed_w_dev_ptr, q_weight_shape.product() * sizeof(ElementW));
+
+  auto err = Base::prepack_weights(rows, columns, gsl::make_span(o_elements_dev_ptr, q_weight_shape.product()), gsl::make_span(packed_w_dev_ptr, q_weight_shape.product()));
   if (!err.empty()) {
     throw std::runtime_error(err);
   }
+  cudaMemcpy(packed_w.data(), packed_w_dev_ptr, q_weight_shape.product() * sizeof(ElementW), cudaMemcpyDeviceToHost);
 
   for (int col = 0; col < tensor_packed_w.shape()[1]; ++col) {
     for (int row = 0; row < tensor_packed_w.shape()[0]; ++row) {

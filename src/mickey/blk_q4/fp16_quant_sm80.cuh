@@ -74,6 +74,20 @@ void block_quantize_kernel(
     int columns,
     int leadingDimension);
 
+template <
+    typename ElementT,
+    int block_size,
+    int qbits,
+    bool Columnwise,
+    bool ExtraBoundsCheck = false>
+__global__
+void prepack_weights_kernel(
+    int rows,
+    int columns,
+    const uint8_t* weights,      // <- int4 weights, column major
+    uint8_t* weights_prepacked,  // <- int4 prepacked weights tensor, same size buffer
+    size_t buf_size);
+
 template <int qbits>
 struct BitsTraits {
     static_assert(qbits <= 8, "Only BitsTraits are for small number of bits!");
@@ -364,6 +378,63 @@ struct BlockwiseQuantization {
    *
    * This pack a 8x16 int8 tile into a 16x8 int8 tile, i.e. a 8x8 16b tile
    */
+  CUTLASS_DEVICE
+  static void dev_prepack_weights(
+    int rows,
+    int columns,
+    const uint8_t* weights,     // <- int4 weights, column major
+    uint8_t* weights_prepacked, // <- int4 prepacked weights tensor, same size buffer
+    size_t buf_size
+  ) {
+    // locate the coordinate of the tile in the weight matrix
+    int row_dtile = blockIdx.x * blockDim.x + threadIdx.x;
+    int col_dtile = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row_dtile >= rows / 16 || col_dtile >= columns / 16) {
+      return;
+    }
+
+    const MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, ExtraBoundsCheck>
+        tensor_weight(weights, buf_size, cutlass::make_Coord(rows / 2, columns));
+    const MatrixRef<uint8_t, LayoutWPack, ExtraBoundsCheck>
+        tensor_weight_prepacked(weights_prepacked, buf_size, cutlass::make_Coord(rows, columns / 2));
+
+    auto t0_base = cutlass::make_Coord(0, 0);
+    auto t1_base = cutlass::make_Coord(4, 0);
+    auto t2_base = cutlass::make_Coord(0, 8);
+    auto t3_base = cutlass::make_Coord(4, 8);
+
+    // below is the loop body of 
+    //   for (int col_dtile = 0; col_dtile < columns / 16; ++col_dtile) {
+    //     for (int row_dtile = 0; row_dtile < rows / 16; ++row_dtile) {
+    //       HERE...
+    //     }
+    //   }
+
+    // Packing from a 8x16 tile to a 16x8 tile
+    auto dtile_base = cutlass::make_Coord(row_dtile * 8, col_dtile * 16);
+    auto packed_tile_base = cutlass::make_Coord(row_dtile * 16, col_dtile * 8);
+    for (int col = 0; col < 8; ++col) {
+      for (int row = 0; row < 4; ++row) {
+        auto cord = cutlass::make_Coord(row, col);
+        auto packed_cord = packed_tile_base + cutlass::make_Coord(row * 4, col);  // packed tile is 16x8
+        uint8_t buf[4];
+        buf[0] = tensor_weight.at(dtile_base + t0_base + cord);
+        buf[1] = tensor_weight.at(dtile_base + t1_base + cord);
+        buf[2] = tensor_weight.at(dtile_base + t2_base + cord);
+        buf[3] = tensor_weight.at(dtile_base + t3_base + cord);
+
+        // [0, 1, 2, 3, 4, 5, 6, 7] => [0, 2, 4, 6, 1, 3, 5, 7] so that each pair of adjacent weights
+        // are in different b16 register at the same positions. This makes it easier to convert to
+        // fp16x2 format in a b32 register
+
+        tensor_weight_prepacked.at(packed_cord) = (buf[0] & 0x0f) | ((buf[1] & 0x0f) << 4);
+        tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(1, 0)) = (buf[2] & 0x0f) | ((buf[3] & 0x0f) << 4);
+        tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(2, 0)) = ((buf[0] & 0xf0) >> 4) | (buf[1] & 0xf0);
+        tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(3, 0)) = ((buf[2] & 0xf0) >> 4) | (buf[3] & 0xf0);
+      }
+    }
+  }
+
   static std::string prepack_weights(
       int rows,
       int columns,
@@ -383,43 +454,14 @@ struct BlockwiseQuantization {
       return "Prepacked Weight tensor buffer should be the same size!";
     }
 
-    const MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, ExtraBoundsCheck>
-        tensor_weight(weights, cutlass::make_Coord(rows / 2, columns));
-    const MatrixRef<uint8_t, LayoutWPack, ExtraBoundsCheck>
-        tensor_weight_prepacked(weights_prepacked, cutlass::make_Coord(rows, columns / 2));
+    constexpr int thread_blk_size = 16;
+    constexpr int grid_stride = thread_blk_size * 16; // one thread process 16 items, one thread block has 16 threads
+    dim3 block_dim(thread_blk_size, thread_blk_size);
+    dim3 grid_dim((rows + grid_stride - 1) / grid_stride, (columns + grid_stride - 1) / grid_stride);
 
-    // TODO(fuchen)!! parallized this.
-    auto t0_base = cutlass::make_Coord(0, 0);
-    auto t1_base = cutlass::make_Coord(4, 0);
-    auto t2_base = cutlass::make_Coord(0, 8);
-    auto t3_base = cutlass::make_Coord(4, 8);
-    for (int col_dtile = 0; col_dtile < columns / 16; ++col_dtile) {
-      for (int row_dtile = 0; row_dtile < rows / 16; ++row_dtile) {
-        // Packing from a 8x16 tile to a 16x8 tile
-        auto dtile_base = cutlass::make_Coord(row_dtile * 8, col_dtile * 16);
-        auto packed_tile_base = cutlass::make_Coord(row_dtile * 16, col_dtile * 8);
-        for (int col = 0; col < 8; ++col) {
-          for (int row = 0; row < 4; ++row) {
-            auto cord = cutlass::make_Coord(row, col);
-            auto packed_cord = packed_tile_base + cutlass::make_Coord(row * 4, col);  // packed tile is 16x8
-            uint8_t buf[4];
-            buf[0] = tensor_weight.at(dtile_base + t0_base + cord);
-            buf[1] = tensor_weight.at(dtile_base + t1_base + cord);
-            buf[2] = tensor_weight.at(dtile_base + t2_base + cord);
-            buf[3] = tensor_weight.at(dtile_base + t3_base + cord);
+    prepack_weights_kernel<ElementT, block_size, qbits, Columnwise, ExtraBoundsCheck>
+        <<<grid_dim, block_dim>>>(rows, columns, weights.data(), weights_prepacked.data(), weights.size());
 
-            // [0, 1, 2, 3, 4, 5, 6, 7] => [0, 2, 4, 6, 1, 3, 5, 7] so that each pair of adjacent weights
-            // are in different b16 register at the same positions. This makes it easier to convert to
-            // fp16x2 format in a b32 register
-
-            tensor_weight_prepacked.at(packed_cord) = (buf[0] & 0x0f) | ((buf[1] & 0x0f) << 4);
-            tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(1, 0)) = (buf[2] & 0x0f) | ((buf[3] & 0x0f) << 4);
-            tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(2, 0)) = ((buf[0] & 0xf0) >> 4) | (buf[1] & 0xf0);
-            tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(3, 0)) = ((buf[2] & 0xf0) >> 4) | (buf[3] & 0xf0);
-          }
-        }
-      }
-    }
     return std::string();
   }
 
@@ -608,6 +650,24 @@ void block_quantize_kernel(
     return;
   }
   QuantType::dev_quantize_blk(dst, scales, zero_points, src, rows, columns, leadingDimension, block_idx);
+}
+
+template <
+    typename ElementT,
+    int block_size,
+    int qbits,
+    bool Columnwise,
+    bool ExtraBoundsCheck>
+__global__
+void prepack_weights_kernel(
+    int rows,
+    int columns,
+    const uint8_t* weights,      // <- int4 weights, column major
+    uint8_t* weights_prepacked,  // <- int4 prepacked weights tensor, same size buffer
+    size_t buf_size)
+{
+  using QuantType = BlockwiseQuantization<ElementT, block_size, qbits, Columnwise, ExtraBoundsCheck>;
+  QuantType::dev_prepack_weights(rows, columns, weights, weights_prepacked, buf_size);
 }
 
 
