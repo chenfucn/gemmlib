@@ -1,6 +1,9 @@
 
 #include "gemmlib.h"
 #include "blk_q4/f16_gemm_sm80.h"
+#include "blk_q4/fp16_quant_sm80.cuh"
+
+#include "cuda_ptr.h"
 
 namespace mickey {
 
@@ -14,11 +17,11 @@ template<
     bool small_m,
     bool has_offsets>
 std::string blkq4_gemm_sm80(int m, int n, int k, cudaStream_t stream,
-                     gsl::span<half const> a,
-                     gsl::span<uint8_t const> weights,
-                     gsl::span<half const> scales,
-                     gsl::span<uint8_t const> offsets,
-                     gsl::span<half> output) {
+                            gsl::span<half const> a,
+                            gsl::span<uint8_t const> weights,
+                            gsl::span<half const> scales,
+                            gsl::span<uint8_t const> offsets,
+                            gsl::span<half> output) {
 
   using ElementDequant = cutlass::half_t;
   using QuantBlocking =
@@ -203,5 +206,145 @@ std::string blkq4_fp16_gemm_sm80_dispatch(
 
   return "Unsupported block size: " + std::to_string(block_size);
 }
+
+
+template<
+    int block_size,
+    bool column_wise_blocking,
+    bool has_offsets>
+std::string blkq4_quant_sm80(
+    int rows, int columns, int leadingDimension,
+    cudaStream_t stream,
+    gsl::span<half const> weights,
+    gsl::span<uint8_t> quant_weights,
+    gsl::span<half> scales,
+    gsl::span<uint8_t> offsets) 
+{
+  if (rows == 0 || columns == 0) {
+    return std::string();
+  }
+
+#ifndef NDEBUG
+  constexpr bool ExtraBoundsChecking = true;
+#else
+  constexpr bool ExtraBoundsChecking = false;
+#endif
+
+  using ElementT = half;
+  using Base = mickey::BlockwiseQuantization<
+      ElementT,
+      block_size,
+      4,
+      column_wise_blocking,
+      ExtraBoundsChecking>;
+
+  using QuantBlocking = typename Base::QuantBlocking;
+  using ElementW = typename Base::ElementW;
+  using LayoutWPack = typename Base::LayoutWPack;
+  using ElementQOffset = typename Base::ElementQOffset;
+  using LayoutQmeta = typename Base::LayoutQmeta;
+
+  const auto q_weight_shape = Base::get_quant_weights_shape(rows, columns);
+  const auto meta_shape = Base::get_quant_meta_shape(rows, columns);
+  if (quant_weights.size() < q_weight_shape.product()) {
+    return "Unexpected quantized weight tensor size: " + std::to_string(quant_weights.size())
+           + " expected: " + std::to_string(q_weight_shape.product());
+  }
+  if (scales.size() < meta_shape.product()) {
+    return "Unexpected scale tensor size: " + std::to_string(scales.size())
+           + " expected: " + std::to_string(meta_shape.product());
+  }
+  if constexpr (has_offsets) {
+    if (offsets.size() < meta_shape.product()) {
+      return "Unexpected offset tensor size: " + std::to_string(offsets.size())
+             + " expected: " + std::to_string(meta_shape.product());
+    }
+  }
+
+  // allocate temp device memory for quantized weights and meta data, for prepacking
+  auto quant_weights_dev_ptr = make_cuda_unique<ElementW>(q_weight_shape.product());
+  auto q_weights_buf = gsl::make_span(quant_weights_dev_ptr.get(), q_weight_shape.product());
+
+  auto scales_dev_ptr = make_cuda_unique<ElementT>(meta_shape.product());
+  auto scales_buf = gsl::make_span(scales_dev_ptr.get(), meta_shape.product());
+
+  cuda_unique_ptr<ElementQOffset> quant_offsets_dev_ptr = has_offsets ? make_cuda_unique<ElementQOffset>(meta_shape.product()) : make_cuda_unique<ElementQOffset>();
+  gsl::span<ElementQOffset> quant_offsets_buf = has_offsets ? gsl::make_span(quant_offsets_dev_ptr.get(), meta_shape.product()) : gsl::span<ElementQOffset>();
+
+  Base::block_quantize(q_weights_buf.data(), scales_buf.data(),
+                       has_offsets ? quant_offsets_buf.data() : nullptr,
+                       weights.data(), rows, columns, leadingDimension, stream);
+  auto err = Base::prepack_weights(rows, columns,
+                                   q_weights_buf, quant_weights, stream);
+  if (!err.empty()) {
+    return err;
+  }
+  err = Base::prepack_quant_meta(rows, columns,
+                                 scales_buf, scales,
+                                 has_offsets ? quant_offsets_buf : gsl::span<ElementQOffset>(),
+                                 has_offsets ? offsets : gsl::span<ElementQOffset>(),
+                                 stream);
+
+  return err;
+}
+
+
+
+std::string blkq4_fp16_quant_sm80_dispatch(
+    int block_size,
+    bool column_wise_blocking,
+    int rows, int columns, int leadingDimension,
+    cudaStream_t stream,
+    gsl::span<half const> weights,
+    gsl::span<uint8_t> quant_weights,
+    gsl::span<half> scales,
+    gsl::span<uint8_t> offsets) 
+{
+  switch (block_size)
+  {
+  case 16:
+    if (column_wise_blocking) {
+      if (offsets.empty())
+        return blkq4_quant_sm80<16, true, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<16, true, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    } else {
+      if (offsets.empty())
+        return blkq4_quant_sm80<16, false, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<16, false, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    }
+    break;
+  case 32:
+    if (column_wise_blocking) {
+      if (offsets.empty())
+        return blkq4_quant_sm80<32, true, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<32, true, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    } else {
+      if (offsets.empty())
+        return blkq4_quant_sm80<32, false, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<32, false, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    }
+    break;
+  case 64:
+    if (column_wise_blocking) {
+      if (offsets.empty())
+        return blkq4_quant_sm80<64, true, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<64, true, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    } else {
+      if (offsets.empty())
+        return blkq4_quant_sm80<64, false, false>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+      else
+        return blkq4_quant_sm80<64, false, true>(rows, columns, leadingDimension, stream, weights, quant_weights, scales, offsets);
+    }
+    break;  
+  default:
+    return "Unsupported block size: " + std::to_string(block_size);
+  }
+}
+
 
 }  // namespace mickey

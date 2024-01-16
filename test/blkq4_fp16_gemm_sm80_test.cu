@@ -19,6 +19,7 @@
 #include "blk_q4/fp16_quant_sm80.cuh"
 #include "blkq4_fp16_gemm_sm80.h"
 
+#include "gemmlib.h"
 
 namespace onnxruntime {
 namespace test {
@@ -180,46 +181,54 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
   }
 
   //
-  // Quantization tool outputs:
+  // Run quantization tool:
   //
-  std::vector<ElementW> o_elements(q_weight_shape.product());
-  mickey::MatrixRef<ElementW, cutlass::layout::ColumnMajor, true> tensor_o_elements(o_elements, q_weight_shape);
   ElementW *o_elements_dev_ptr = nullptr;
   cudaMalloc(&o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW));
 
-  std::vector<ElementT> o_scales(meta_shape.product());
-  mickey::MatrixRef<ElementT, cutlass::layout::ColumnMajor, true> tensor_o_scales(o_scales, meta_shape);
   ElementT *o_scales_dev_ptr = nullptr;
   cudaMalloc(&o_scales_dev_ptr, meta_shape.product() * sizeof(ElementT));
 
-  std::vector<uint8_t> o_zp(meta_shape.product());
-  mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_o_zp(o_zp, meta_shape);
   uint8_t *o_zp_dev_ptr = nullptr;
   cudaMalloc(&o_zp_dev_ptr, meta_shape.product() * sizeof(uint8_t));
 
   cudaMemcpy(dequants_dev_ptr, dequants.data(), rows * columns * sizeof(ElementT), cudaMemcpyHostToDevice);
 
-  // static void block_quantize(
-  //     uint8_t* dst,
-  //     ElementT* scales,
-  //     uint8_t* zero_points,
-  //     const ElementT* src,
-  //     int rows,
-  //     int columns,
-  //     int leadingDimension,
-  //     cudaStream_t stream)
+  auto err = mickey::blkq4_fp16_quant_sm80_dispatch(
+    block_size,
+    ColumnMajorQuantBlocking,
+    rows, columns, columns,
+    0,
+    gsl::make_span(dequants_dev_ptr, rows * columns),
+    gsl::make_span(o_elements_dev_ptr, q_weight_shape.product()),
+    gsl::make_span(o_scales_dev_ptr, meta_shape.product()),
+    has_offset ? gsl::make_span(o_zp_dev_ptr, meta_shape.product()) : gsl::span<uint8_t>()); 
 
-  Base::block_quantize(o_elements_dev_ptr, o_scales_dev_ptr, o_zp_dev_ptr,
-                       dequants_dev_ptr, rows, columns, columns, 0);
+  //
+  // Copy results from device to host
+  //
+  std::vector<ElementW> o_elements(q_weight_shape.product());
+  mickey::MatrixRef<ElementW, cutlass::layout::ColumnMajor, true> tensor_o_elements(o_elements, cutlass::make_Coord(rows, columns / 2));
 
-  cudaDeviceSynchronize();
+  std::vector<ElementT> packed_scales(meta_shape.product());
+  mickey::MatrixRef<ElementT, LayoutQmeta, true> tensor_packed_scales(
+      packed_scales, meta_shape);
+
+  std::vector<ElementQOffset> packed_zp(meta_shape.product());
+  mickey::MatrixRef<ElementQOffset, LayoutQmeta, true> tensor_packed_zp(
+      packed_zp, meta_shape);
   cudaMemcpy(o_elements.data(), o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW), cudaMemcpyDeviceToHost);
-  cudaMemcpy(o_scales.data(), o_scales_dev_ptr, meta_shape.product() * sizeof(ElementT), cudaMemcpyDeviceToHost);
-  cudaMemcpy(o_zp.data(), o_zp_dev_ptr, meta_shape.product() * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+  cudaMemcpy(packed_scales.data(), o_scales_dev_ptr, meta_shape.product() * sizeof(ElementT), cudaMemcpyDeviceToHost);
+  cudaMemcpy(packed_zp.data(), o_zp_dev_ptr, meta_shape.product() * sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
-  for (int col = 0; col < tensor_q_weight.shape()[1]; ++col) {
-    for (int row = 0; row < tensor_q_weight.shape()[0]; ++row) {
-      if (tensor_o_elements.at(row, col) != tensor_q_weight.at(row, col)) {
+  // Verify prepacked weights
+  std::vector<ElementW> packed_w_ref(q_weight_shape.product());
+  mickey::MatrixRef<ElementW, LayoutWPack, true> tensor_packed_w_ref(
+      packed_w_ref, cutlass::make_Coord(rows, columns / 2));
+  onnxruntime::cuda::test::prepack_weights_ref(rows, columns, tensor_q_weight, tensor_packed_w_ref);
+  for (int col = 0; col < tensor_packed_w_ref.shape()[1]; ++col) {
+    for (int row = 0; row < tensor_packed_w_ref.shape()[0]; ++row) {
+      if (tensor_o_elements.at(row, col) != tensor_packed_w_ref.at(row, col)) {
         throw std::runtime_error("quantized value mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
             + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
             + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
@@ -227,75 +236,7 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
     }
   }
 
-  for (int col = 0; col < meta_shape[1]; ++col) {
-    for (int row = 0; row < meta_shape[0]; row += 2) {
-      if (has_offset) {
-        if (tensor_offset.at(row + 0, col) != tensor_o_zp.at(row + 0, col)) {
-          throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-              + " expected " + std::to_string(tensor_offset.at(row + 0, col))
-              + " got " + std::to_string(tensor_o_zp.at(row + 0, col))
-              + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-              + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-        }
-        if (row + 1 < meta_shape[0]) {
-          if (tensor_offset.at(row + 1, col) != tensor_o_zp.at(row + 1, col)) {
-            throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
-                + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-                + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-          }
-        }
-      }
-
-      if (tensor_scale.at(row + 0, col) != tensor_o_scales.at(row + 0, col)) {
-        throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-      }
-      if (row + 1 < meta_shape[0]) {
-        if (tensor_scale.at(row + 1, col) != tensor_o_scales.at(row + 1, col)) {
-          throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
-              + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-              + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-        }
-      }
-    }
-  }
-
-  //
-  // Now we just setup fp16 weights tensor_dequant, quantized weights tensor_q_weight,
-  // quantization scale tensor_scale and quantization offset tensor_offset. The above
-  // testing just make sure our test setup is consistent with quantization tool output.
-  //
-  // Next we test the prepack code
-  //
-
-  std::vector<ElementW> packed_w_ref(q_weight_shape.product());
-  mickey::MatrixRef<ElementW, LayoutWPack, true> tensor_packed_w_ref(
-      packed_w_ref, cutlass::make_Coord(rows, columns / 2));
-  onnxruntime::cuda::test::prepack_weights_ref(rows, columns, tensor_q_weight, tensor_packed_w_ref);
-
-  std::vector<ElementW> packed_w(q_weight_shape.product());
-  mickey::MatrixRef<ElementW, LayoutWPack, true> tensor_packed_w(
-      packed_w, cutlass::make_Coord(rows, columns / 2));
-  ElementW *packed_w_dev_ptr = nullptr;
-  cudaMalloc(&packed_w_dev_ptr, q_weight_shape.product() * sizeof(ElementW));
-
-  auto err = Base::prepack_weights(rows, columns, gsl::make_span(o_elements_dev_ptr, q_weight_shape.product()), gsl::make_span(packed_w_dev_ptr, q_weight_shape.product()));
-  if (!err.empty()) {
-    throw std::runtime_error(err);
-  }
-  cudaMemcpy(packed_w.data(), packed_w_dev_ptr, q_weight_shape.product() * sizeof(ElementW), cudaMemcpyDeviceToHost);
-
-  for (int col = 0; col < tensor_packed_w.shape()[1]; ++col) {
-    for (int row = 0; row < tensor_packed_w.shape()[0]; ++row) {
-      if (tensor_packed_w_ref.at(row, col) != tensor_packed_w.at(row, col)) {
-        throw std::runtime_error("prepacked weights mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-      }
-    }
-  }
-
+  // Verify prepacked scales and offsets
   std::vector<ElementT> packed_scales_ref(meta_shape.product());
   mickey::MatrixRef<ElementT, LayoutQmeta, true> tensor_packed_s_ref =
       Base::ShouldRearrangeMeta ? mickey::make_MatrixRef<ElementT, LayoutQmeta, true>(packed_scales_ref, meta_shape)
@@ -304,26 +245,6 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
     onnxruntime::cuda::test::prepack_quant_scales_ref<ElementT, LayoutQmeta, QuantBlocking>(
         rows, columns, tensor_scale.const_ref(), tensor_packed_s_ref);
   }
-
-  std::vector<ElementT> packed_scales(meta_shape.product());
-  mickey::MatrixRef<ElementT, LayoutQmeta, true> tensor_packed_s(
-      packed_scales, meta_shape);
-  err = Base::prepack_quant_scales(rows, columns, o_scales, packed_scales);
-  if (!err.empty()) {
-    throw std::runtime_error(err);
-  }
-
-  for (int col = 0; col < tensor_packed_s.shape()[1]; ++col) {
-    for (int row = 0; row < tensor_packed_s.shape()[0]; ++row) {
-      if (tensor_packed_s_ref.at(row, col) != tensor_packed_s.at(row, col)){
-        throw std::runtime_error("prepacked scales mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-      }
-    }
-  }
-
-  if (has_offset) {
     std::vector<ElementQOffset> packed_zp_ref(meta_shape.product());
     mickey::MatrixRef<ElementQOffset, LayoutQmeta, true> tensor_packed_zp_ref =
         Base::ShouldRearrangeMeta ? mickey::make_MatrixRef<ElementQOffset, LayoutQmeta, true>(packed_zp_ref, meta_shape)
@@ -332,27 +253,40 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
       onnxruntime::cuda::test::prepack_quant_offsets_ref<LayoutQmeta, QuantBlocking>(
           rows, columns, tensor_offset.const_ref(), tensor_packed_zp_ref);
     }
+  for (int col = 0; col < meta_shape[1]; ++col) {
+    for (int row = 0; row < meta_shape[0]; row += 2) {
+      if (has_offset) {
+        if (tensor_packed_zp_ref.at(row + 0, col) != tensor_packed_zp.at(row + 0, col)) {
+          throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
+              + " expected " + std::to_string(tensor_packed_zp_ref.at(row + 0, col))
+              + " got " + std::to_string(tensor_packed_zp.at(row + 0, col))
+              + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
+              + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
+        }
+        if (row + 1 < meta_shape[0]) {
+          if (tensor_packed_zp_ref.at(row + 1, col) != tensor_packed_zp.at(row + 1, col)) {
+            throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
+                + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
+                + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
+          }
+        }
+      }
 
-    std::vector<ElementQOffset> packed_zp(meta_shape.product());
-    mickey::MatrixRef<ElementQOffset, LayoutQmeta, true> tensor_packed_zp(
-        packed_zp, meta_shape);
-    err = Base::prepack_quant_offsets(rows, columns, o_zp, packed_zp);
-    if (!err.empty()) {
-      throw std::runtime_error(err);
-    }
-
-    for (int col = 0; col < tensor_packed_zp.shape()[1]; ++col) {
-      for (int row = 0; row < tensor_packed_zp.shape()[0]; ++row) {
-        if (tensor_packed_zp_ref.at(row, col) != tensor_packed_zp.at(row, col)) {
-          throw std::runtime_error("prepacked offsets mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-              + " expected " + std::to_string(tensor_packed_zp_ref.at(row, col))
-              + " got " + std::to_string(tensor_packed_zp.at(row, col))
+      if (tensor_packed_s_ref.at(row + 0, col) != tensor_packed_scales.at(row + 0, col)) {
+        throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
+            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
+            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
+      }
+      if (row + 1 < meta_shape[0]) {
+        if (tensor_packed_s_ref.at(row + 1, col) != tensor_packed_scales.at(row + 1, col)) {
+          throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
               + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
               + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
         }
       }
     }
   }
+
 }
 
 /*
@@ -417,6 +351,7 @@ int main(int argc, char** argv) {
   onnxruntime::test::testPrepack<false>(32, 32, false);
   onnxruntime::test::testPrepack<true>(32, 32);
   onnxruntime::test::testPrepack<true>(32, 32, false);
+
   onnxruntime::test::testPrepack<false>(32, 64);
   onnxruntime::test::testPrepack<false>(32, 128);
   onnxruntime::test::testPrepack<false>(32, 256);
@@ -427,6 +362,7 @@ int main(int argc, char** argv) {
   onnxruntime::test::testPrepack<false>(32, 128, false);
   onnxruntime::test::testPrepack<false>(128, 32, false);
   onnxruntime::test::testPrepack<false>(256, 256, false);
+
   onnxruntime::test::testPrepack<true>(32, 64);
   onnxruntime::test::testPrepack<true>(32, 128);
   onnxruntime::test::testPrepack<true>(32, 256);

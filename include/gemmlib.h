@@ -20,4 +20,15 @@ std::string blkq4_fp16_gemm_sm80_dispatch(
   gsl::span<uint8_t const> offsets,
   gsl::span<half> output);
 
+
+std::string blkq4_fp16_quant_sm80_dispatch(
+    int block_size,
+    bool column_wise_blocking,
+    int rows, int columns, int leadingDimension,
+    cudaStream_t stream,
+    gsl::span<half const> weights,
+    gsl::span<uint8_t> quant_weights,
+    gsl::span<half> scales,
+    gsl::span<uint8_t> offsets);
+
 }  // namespace mickey

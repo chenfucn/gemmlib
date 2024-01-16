@@ -88,6 +88,22 @@ void prepack_weights_kernel(
     uint8_t* weights_prepacked,  // <- int4 prepacked weights tensor, same size buffer
     size_t buf_size);
 
+template <
+    typename ElementT,
+    int block_size,
+    int qbits,
+    bool Columnwise,
+    bool ExtraBoundsCheck = false>
+__global__
+void prepack_scales_kernel(
+    int meta_rows,
+    int meta_columns,
+    const ElementT* scales,     // <- quant scales, column major layout
+    ElementT* scales_prepacked, // <- quant scales prepacked, same size buffer
+    const uint8_t* offsets,     // <- quant offsets, int4, column major layout
+    uint8_t* offsets_prepacked, // <- quant offsets prepacked, double size buffer
+    size_t buf_size);
+
 template <int qbits>
 struct BitsTraits {
     static_assert(qbits <= 8, "Only BitsTraits are for small number of bits!");
@@ -439,7 +455,8 @@ struct BlockwiseQuantization {
       int rows,
       int columns,
       const gsl::span<uint8_t const>& weights,     // <- int4 weights, column major
-      const gsl::span<uint8_t>& weights_prepacked  // <- int4 prepacked weights tensor, same size buffer
+      const gsl::span<uint8_t>& weights_prepacked, // <- int4 prepacked weights tensor, same size buffer
+      cudaStream_t stream = 0
   ) {
     if (!((rows % 16) == 0 && (columns % 16) == 0 &&
           (rows % QuantBlocking::kRow) == 0 &&
@@ -460,7 +477,7 @@ struct BlockwiseQuantization {
     dim3 grid_dim((rows + grid_stride - 1) / grid_stride, (columns + grid_stride - 1) / grid_stride);
 
     prepack_weights_kernel<ElementT, block_size, qbits, Columnwise, ExtraBoundsCheck>
-        <<<grid_dim, block_dim>>>(rows, columns, weights.data(), weights_prepacked.data(), weights.size());
+        <<<grid_dim, block_dim, 0, stream>>>(rows, columns, weights.data(), weights_prepacked.data(), weights.size());
 
     return std::string();
   }
@@ -472,13 +489,122 @@ struct BlockwiseQuantization {
    */
   static constexpr bool ShouldRearrangeMeta = sizeof(ElementT) == 2 && QuantBlocking::kRow == 1;
 
-  static std::string prepack_quant_scales(
+  CUTLASS_DEVICE
+  static void dev_prepack_scales(
+    int meta_rows,
+    int meta_columns,
+    const ElementT* scales,     // <- quant scales, column major layout
+    ElementT* scales_prepacked, // <- quant scales prepacked, same size buffer
+    const uint8_t* offsets,     // <- quant offsets, int4, column major layout
+    uint8_t* offsets_prepacked, // <- quant offsets prepacked, double
+    size_t buf_size
+  ) {
+    int row_blk = blockIdx.x * blockDim.x + threadIdx.x * 16;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row_blk >= meta_rows || col >= meta_columns) {
+      return;
+    }
+
+    auto meta_shape = cutlass::make_Coord(meta_rows, meta_columns);
+    const MatrixRef<ElementT const, cutlass::layout::ColumnMajor, ExtraBoundsCheck>
+        tensor_scale(scales, buf_size, meta_shape);
+    const MatrixRef<ElementT, LayoutQmeta, ExtraBoundsCheck>
+        tensor_scale_prepacked(scales_prepacked, buf_size, meta_shape);
+
+    if constexpr (ShouldRearrangeMeta) {
+      // In Ampere tensor op, each operand B tile is 8 x 8, in a warp of 32 threads, each thread
+      // holds a fragment of the tile containing 2 elements in the k dimension. Most often we use
+      // mma instruction shape of 16x8x16, which means 2 B tiles are stacked in the k dimension,
+      // as shown below (T stands for thread):
+      // T0, T4, T8, T12
+      // T1, T5, T9, T13
+      // T2, T6, T10, T14
+      // T3, T7, T11, T15
+      // T0, T4, T8, T12
+      // T1, T5, T9, T13
+      // T2, T6, T10, T14
+      // T3, T7, T11, T15
+      //
+      // We need to deliver quantization scale and offset elements to the corresponding threads,
+      // so we can perform dequantization efficiently. With a column major layout, each thread
+      // needs two separate loads for a mma instruction, due to the tile fragment layout shown
+      // above. To reduce the number of loads, we rearrange each column as below, so we can use
+      // a single load to load fragments for two tiles:
+      // T0        T0
+      // T1        T0
+      // T2        T1
+      // T3   =>   T1
+      // T0        T2
+      // T1        T2
+      // T2        T3
+      // T3        T3
+      for (int thread_id = 0; thread_id < 4; thread_id++) {
+        const int dst_idx = row_blk + thread_id * 4;
+        const int src_idx = row_blk + thread_id * 2;
+        tensor_scale_prepacked.at(dst_idx + 0, col) = tensor_scale.at(src_idx + 0, col);
+        tensor_scale_prepacked.at(dst_idx + 1, col) = tensor_scale.at(src_idx + 1, col);
+        tensor_scale_prepacked.at(dst_idx + 2, col) = tensor_scale.at(src_idx + 8, col);
+        tensor_scale_prepacked.at(dst_idx + 3, col) = tensor_scale.at(src_idx + 9, col);
+        if (offsets) {
+        }
+      }
+    } else {
+      // Potential transpose if the prepacked layout is different from the original layout
+      for (int row = 0; row < min(16, meta_rows - row_blk); ++row) {
+        tensor_scale_prepacked.at(row_blk + row, col) = tensor_scale.at(row_blk + row, col);
+      }
+    }
+
+    if (offsets != nullptr) {
+      MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, ExtraBoundsCheck>
+          tensor_offset(offsets, buf_size, meta_shape);
+      MatrixRef<uint8_t, LayoutQmeta, ExtraBoundsCheck> tensor_offset_prepacked(offsets_prepacked, buf_size, meta_shape);
+      if constexpr (ShouldRearrangeMeta) {
+        for (int thread_id = 0; thread_id < 4; thread_id++) {
+          const int dst_idx = row_blk + thread_id * 4;
+          const int src_idx = row_blk + thread_id * 2;
+
+          // [a, b, c, d] => [a, c, b, d] so that adjacent weights are in their own
+          // 16b element: [a, x, b, x] and [x, c, x, d], which makes it easier to
+          // convert to fp16x2 format in a b32 register
+          tensor_offset_prepacked.at(dst_idx + 0, col) = tensor_offset.at(src_idx + 0, col);
+          tensor_offset_prepacked.at(dst_idx + 1, col) = tensor_offset.at(src_idx + 8, col);
+          tensor_offset_prepacked.at(dst_idx + 2, col) = tensor_offset.at(src_idx + 1, col);
+          tensor_offset_prepacked.at(dst_idx + 3, col) = tensor_offset.at(src_idx + 9, col);
+        }
+      } else {
+        // Potential transpose if the prepacked layout is different from the original layout
+        for (int row = 0; row < min(16, meta_rows - row_blk); ++row) {
+          tensor_offset_prepacked.at(row_blk + row, col) = tensor_offset.at(row_blk + row, col);
+        }
+      }
+    }
+  }
+
+  static std::string prepack_quant_meta(
       size_t rows,
       size_t columns,
       const gsl::span<ElementT const>& scales,     // <- quant scales, column major layout
-      const gsl::span<ElementT>& scales_prepacked  // <- quant scales prepacked, same size buffer
+      const gsl::span<ElementT>& scales_prepacked, // <- quant scales prepacked, same size buffer
+      const gsl::span<uint8_t const>& offsets,     // <- quant offsets, int4, column major layout
+      const gsl::span<uint8_t>& offsets_prepacked, // <- quant offsets prepacked, double size buffer
+      cudaStream_t stream = 0
   ) {
+    if ((rows % 16) != 0 || (columns % 16) != 0) {
+      return "Does not support odd number of rows or columns!";
+    }
+
     auto meta_shape = get_quant_meta_shape(rows, columns);
+    if (!offsets.empty()) {
+      if (offsets.size() != size_t(meta_shape.product())) {
+        return "Quantization offset tensor shape mismatch! Expected " +
+              std::to_string(meta_shape.product()) + " elements, got " +
+              std::to_string(offsets.size()) + " elements!";
+      }
+      if (offsets_prepacked.size() != size_t(meta_shape.product())) {
+        return "Wrong buffer size for prepacked quantization offsets!";
+      }
+    }
     if (scales.size() != size_t(meta_shape.product())) {
       return "Quantization scale tensor shape mismatch!";
     }
@@ -486,146 +612,17 @@ struct BlockwiseQuantization {
       return "Prepacked quantization scale tensor buffer should be the same size!";
     }
 
-    MatrixRef<ElementT const, cutlass::layout::ColumnMajor, ExtraBoundsCheck> tensor_scale(scales, meta_shape);
-    MatrixRef<ElementT, LayoutQmeta, ExtraBoundsCheck> tensor_scale_prepacked(scales_prepacked, meta_shape);
-
-    // Only prepacking scale and offset tensors for a often used special case:
-    //    16b gemm (2 elements per 32b register, operand tile shape 8x8)
-    //    2 B operand tiles per mma instruction stacked on k dimension
-    //    (1,n) quantization blocking
-    if constexpr (sizeof(ElementT) == 2 && QuantBlocking::kRow == 1) {
-      // In Ampere tensor op, each operand B tile is 8 x 8, in a warp of 32 threads, each thread
-      // holds a fragment of the tile containing 2 elements in the k dimension. Most often we use
-      // mma instruction shape of 16x8x16, which means 2 B tiles are stacked in the k dimension,
-      // as shown below (T stands for thread):
-      // T0, T4, T8, T12
-      // T1, T5, T9, T13
-      // T2, T6, T10, T14
-      // T3, T7, T11, T15
-      // T0, T4, T8, T12
-      // T1, T5, T9, T13
-      // T2, T6, T10, T14
-      // T3, T7, T11, T15
-      //
-      // We need to deliver quantization scale and offset elements to the corresponding threads,
-      // so we can perform dequantization efficiently. With a column major layout, each thread
-      // needs two separate loads for a mma instruction, due to the tile fragment layout shown
-      // above. To reduce the number of loads, we rearrange each column as below, so we can use
-      // a single load to load fragments for two tiles:
-      // T0        T0
-      // T1        T0
-      // T2        T1
-      // T3   =>   T1
-      // T0        T2
-      // T1        T2
-      // T2        T3
-      // T3        T3
-
-      for (int col = 0; col < tensor_scale.shape()[1]; ++col) {
-        for (int row_blk = 0; row_blk < tensor_scale.shape()[0]; row_blk += 16) {
-          for (int thread_id = 0; thread_id < 4; thread_id++) {
-            const int dst_idx = row_blk + thread_id * 4;
-            const int src_idx = row_blk + thread_id * 2;
-            tensor_scale_prepacked.at(dst_idx + 0, col) = tensor_scale.at(src_idx + 0, col);
-            tensor_scale_prepacked.at(dst_idx + 1, col) = tensor_scale.at(src_idx + 1, col);
-            tensor_scale_prepacked.at(dst_idx + 2, col) = tensor_scale.at(src_idx + 8, col);
-            tensor_scale_prepacked.at(dst_idx + 3, col) = tensor_scale.at(src_idx + 9, col);
-          }
-        }
-      }
-    } else {
-      // In all other cases, we don't prepack scale or offset
-      // Potential transpose if the prepacked layout is different from the original layout
-      for (int col = 0; col < tensor_scale.shape()[1]; ++col) {
-        for (int row = 0; row < tensor_scale.shape()[0]; ++row) {
-          tensor_scale_prepacked.at(row, col) = tensor_scale.at(row, col);
-        }
-      }
-    }
+    // 2D grid of 2D thread blocks
+    constexpr int thread_blk_size = 16; // 256 threads per thread block
+    constexpr int grid_stride = thread_blk_size * 16; // one thread process 16 items, one thread block has 16 threads
+    dim3 block_dim(thread_blk_size, thread_blk_size);
+    dim3 grid_dim((meta_shape[0] + grid_stride - 1) / grid_stride, (columns + thread_blk_size - 1) / thread_blk_size);
+    prepack_scales_kernel<ElementT, block_size, qbits, Columnwise, ExtraBoundsCheck>
+        <<<grid_dim, block_dim, 0, stream>>>(
+            meta_shape[0], meta_shape[1], scales.data(), scales_prepacked.data(), offsets.data(), offsets_prepacked.data(), scales.size());
     return std::string();
   }
 
-  static std::string prepack_quant_offsets(
-      size_t rows,
-      size_t columns,
-      const gsl::span<uint8_t const>& offsets,     // <- quant offsets, int4, column major layout
-      const gsl::span<uint8_t>& offsets_prepacked  // <- quant offsets prepacked, double size buffer
-  ) {
-    auto meta_shape = get_quant_meta_shape(rows, columns);
-
-    if ((rows % 16) != 0 || (columns % 16) != 0) {
-      return "Does not support odd number of rows or columns!";
-    }
-    if (offsets_prepacked.size() != size_t(meta_shape.product())) {
-      return "Wrong buffer size for prepacked quantization offsets!";
-    }
-    if (offsets.size() != size_t(meta_shape.product())) {
-      return "Quantization offset tensor shape mismatch! Expected " +
-             std::to_string(meta_shape.product()) + " elements, got " +
-             std::to_string(offsets.size()) + " elements!";
-    }
-
-    MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, ExtraBoundsCheck>
-        tensor_offset(offsets, meta_shape);
-    MatrixRef<uint8_t, LayoutQmeta, ExtraBoundsCheck> tensor_offset_prepacked(offsets_prepacked, meta_shape);
-
-    // Only prepacking scale and offset tensors for a often used special case:
-    //    16b gemm (2 elements per 32b register, operand tile shape 8x8)
-    //    2 B operand tiles per mma instruction stacked on k dimension
-    //    (1,n) quantization blocking
-    if constexpr (sizeof(ElementT) == 2 && QuantBlocking::kRow == 1) {
-      // In Ampere tensor op, each operand B tile is 8 x 8, in a warp of 32 threads, each thread
-      // holds a fragment of the tile containing 2 elements in the k dimension. Most often we use
-      // mma instruction shape of 16x8x16, which means 2 B tiles are stacked in the k dimension,
-      // as shown below (T stands for thread):
-      // T0, T4, T8, T12
-      // T1, T5, T9, T13
-      // T2, T6, T10, T14
-      // T3, T7, T11, T15
-      // T0, T4, T8, T12
-      // T1, T5, T9, T13
-      // T2, T6, T10, T14
-      // T3, T7, T11, T15
-      //
-      // We need to deliver quantization scale and offset elements to the corresponding threads,
-      // so we can perform dequantization efficiently. With a column major layout, each thread
-      // needs two separate loads for a mma instruction, due to the tile fragment layout shown
-      // above. To reduce the number of loads, we rearrange each column as below, so we can use
-      // a single load to load fragments for two tiles:
-      // T0        T0
-      // T1        T0
-      // T2        T1
-      // T3   =>   T1
-      // T0        T2
-      // T1        T2
-      // T2        T3
-      // T3        T3
-      for (int col = 0; col < meta_shape[1]; ++col) {
-        for (int row_blk = 0; row_blk < meta_shape[0]; row_blk += 16) {
-          for (int thread_id = 0; thread_id < 4; thread_id++) {
-            const int dst_idx = row_blk + thread_id * 4;
-            const int src_idx = row_blk + thread_id * 2;
-            // [a, b, c, d] => [a, c, b, d] so that adjacent weights are in their own
-            // 16b element: [a, x, b, x] and [x, c, x, d], which makes it easier to
-            // convert to fp16x2 format in a b32 register
-            tensor_offset_prepacked.at(dst_idx + 0, col) = tensor_offset.at(src_idx + 0, col);
-            tensor_offset_prepacked.at(dst_idx + 1, col) = tensor_offset.at(src_idx + 8, col);
-            tensor_offset_prepacked.at(dst_idx + 2, col) = tensor_offset.at(src_idx + 1, col);
-            tensor_offset_prepacked.at(dst_idx + 3, col) = tensor_offset.at(src_idx + 9, col);
-          }
-        }
-      }
-    } else {
-      // In all other cases, we don't prepack scale or offset
-      // Potential transpose if the prepacked layout is different from the original layout
-      for (int col = 0; col < meta_shape[1]; ++col) {
-        for (int row = 0; row < meta_shape[0]; ++row) {
-          tensor_offset_prepacked.at(row, col) = tensor_offset.at(row, col);
-        }
-      }
-    }
-    return std::string();
-  }
 };
 
 template <
@@ -670,5 +667,24 @@ void prepack_weights_kernel(
   QuantType::dev_prepack_weights(rows, columns, weights, weights_prepacked, buf_size);
 }
 
+template <
+    typename ElementT,
+    int block_size,
+    int qbits,
+    bool Columnwise,
+    bool ExtraBoundsCheck>
+__global__
+void prepack_scales_kernel(
+    int meta_rows,
+    int meta_columns,
+    const ElementT* scales,     // <- quant scales, column major layout
+    ElementT* scales_prepacked, // <- quant scales prepacked, same size buffer
+    const uint8_t* offsets,     // <- quant offsets, int4, column major layout
+    uint8_t* offsets_prepacked, // <- quant offsets prepacked, double size buffer
+    size_t buf_size)
+{
+  using QuantType = BlockwiseQuantization<ElementT, block_size, qbits, Columnwise, ExtraBoundsCheck>;
+  QuantType::dev_prepack_scales(meta_rows, meta_columns, scales, scales_prepacked, offsets, offsets_prepacked, buf_size);
+}
 
 }  // namespace mickey
