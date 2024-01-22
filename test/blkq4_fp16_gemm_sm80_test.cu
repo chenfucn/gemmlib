@@ -21,10 +21,12 @@
 
 #include "gemmlib.h"
 
+#include "gtest/gtest.h"
+
 namespace onnxruntime {
 namespace test {
 
-template <bool ColumnMajorQuantBlocking>
+template <bool ColumnQuantBlocking>
 void testPrepack(int rows, int columns, bool has_offset = true) {
   using ElementT = half;
   constexpr int block_size = 32;
@@ -32,7 +34,7 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
       ElementT,
       block_size,
       4,
-      ColumnMajorQuantBlocking>;
+      ColumnQuantBlocking>;
 
   using QuantBlocking = typename Base::QuantBlocking;
   using ElementW = typename Base::ElementW;
@@ -196,7 +198,7 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
 
   auto err = mickey::blkq4_fp16_quant_sm80_dispatch(
     block_size,
-    ColumnMajorQuantBlocking,
+    ColumnQuantBlocking,
     rows, columns, columns,
     0,
     gsl::make_span(dequants_dev_ptr, rows * columns),
@@ -228,11 +230,10 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
   onnxruntime::cuda::test::prepack_weights_ref(rows, columns, tensor_q_weight, tensor_packed_w_ref);
   for (int col = 0; col < tensor_packed_w_ref.shape()[1]; ++col) {
     for (int row = 0; row < tensor_packed_w_ref.shape()[0]; ++row) {
-      if (tensor_o_elements.at(row, col) != tensor_packed_w_ref.at(row, col)) {
-        throw std::runtime_error("quantized value mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-      }
+      EXPECT_EQ(tensor_o_elements.at(row, col), tensor_packed_w_ref.at(row, col))
+          << "quantized value mismatch at [" << row << "," << col << "]"
+          << " shape[" << rows << "," << columns << "]"
+          << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
     }
   }
 
@@ -256,122 +257,78 @@ void testPrepack(int rows, int columns, bool has_offset = true) {
   for (int col = 0; col < meta_shape[1]; ++col) {
     for (int row = 0; row < meta_shape[0]; row += 2) {
       if (has_offset) {
-        if (tensor_packed_zp_ref.at(row + 0, col) != tensor_packed_zp.at(row + 0, col)) {
-          throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-              + " expected " + std::to_string(tensor_packed_zp_ref.at(row + 0, col))
-              + " got " + std::to_string(tensor_packed_zp.at(row + 0, col))
-              + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-              + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-        }
+        EXPECT_EQ(tensor_packed_zp_ref.at(row + 0, col), tensor_packed_zp.at(row + 0, col))
+            << "quantized offset mismatch at [" << row << "," << col << "]"
+            << " expected " << tensor_packed_zp_ref.at(row + 0, col)
+            << " got " << tensor_packed_zp.at(row + 0, col)
+            << " shape[" << rows << "," << columns << "]"
+            << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
         if (row + 1 < meta_shape[0]) {
-          if (tensor_packed_zp_ref.at(row + 1, col) != tensor_packed_zp.at(row + 1, col)) {
-            throw std::runtime_error("quantized offset mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
-                + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-                + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-          }
+          EXPECT_EQ(tensor_packed_zp_ref.at(row + 1, col), tensor_packed_zp.at(row + 1, col))
+              << "quantized offset mismatch at [" << (row + 1) << "," << col << "]"
+              << " expected " << tensor_packed_zp_ref.at(row + 1, col)
+              << " got " << tensor_packed_zp.at(row + 1, col)
+              << " shape[" << rows << "," << columns << "]"
+              << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
         }
       }
 
-      if (tensor_packed_s_ref.at(row + 0, col) != tensor_packed_scales.at(row + 0, col)) {
-        throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row) + "," + std::to_string(col) + "]"
-            + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-            + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-      }
+      EXPECT_EQ(tensor_packed_s_ref.at(row + 0, col), tensor_packed_scales.at(row + 0, col))
+          << "quantized scale mismatch at [" << row << "," << col << "]"
+          << " expected " << static_cast<float>(tensor_packed_s_ref.at(row + 0, col))
+          << " got " << static_cast<float>(tensor_packed_scales.at(row + 0, col))
+          << " shape[" << rows << "," << columns << "]"
+          << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
       if (row + 1 < meta_shape[0]) {
-        if (tensor_packed_s_ref.at(row + 1, col) != tensor_packed_scales.at(row + 1, col)) {
-          throw std::runtime_error("quantized scale mismatch at [" + std::to_string(row + 1) + "," + std::to_string(col) + "]"
-              + " shape[" + std::to_string(rows) + "," + std::to_string(columns) + "]"
-              + (ColumnMajorQuantBlocking ? "Column-wise-block" : "Row-wise-block"));
-        }
+        EXPECT_EQ(tensor_packed_s_ref.at(row + 1, col), tensor_packed_scales.at(row + 1, col))
+            << "quantized scale mismatch at [" << (row + 1) << "," << col << "]"
+            << " expected " << static_cast<float>(tensor_packed_s_ref.at(row + 1, col))
+            << " got " << static_cast<float>(tensor_packed_scales.at(row + 1, col))
+            << " shape[" << rows << "," << columns << "]"
+            << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
       }
     }
   }
 
 }
 
-/*
-TEST(BlkQ4_GEMM, Sm80Test) {
-  Status status = onnxruntime::cuda::test::sm80_supported();
-  if (!status.IsOK()) {
-    // skip the test if sm80 is not supported
-    return;
-  }
-
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(32, 32, 64);
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, true>(32, 32, 64);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(32, 96, 64);
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, true>(32, 96, 64);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(32, 96, 192);
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, true>(32, 96, 192);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(256, 672, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, true>(256, 672, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(512, 2048 + 32, 960);
-  onnxruntime::cuda::test::run_blkq4_gemm<32, false, false, false>(512, 2048 + 32, 960);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<16, false, false, false>(256, 672, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<16, false, false, true>(256, 672, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<64, false, false, false>(256, 1024, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<64, false, false, true>(256, 1024, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<16, true, false, false>(256, 672, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<16, true, false, true>(256, 672, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<64, true, false, false>(256, 1024, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<64, true, false, true>(256, 1024, 576);
-
-  // small m
-  onnxruntime::cuda::test::run_blkq4_gemm<16, false, true, false>(16, 704, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<16, false, true, true>(16, 704, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<64, false, true, false>(16, 1024, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<64, false, true, true>(16, 1024, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<16, true, true, false>(16, 672, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<16, true, true, true>(16, 672, 576);
-
-  onnxruntime::cuda::test::run_blkq4_gemm<64, true, true, false>(16, 1024, 576);
-  onnxruntime::cuda::test::run_blkq4_gemm<64, true, true, true>(16, 1024, 576);
+TEST(BlkQ4Fp16GemmPrepack, RowblockSmall) {
+  testPrepack<false>(32, 32);
+  testPrepack<false>(32, 32, false);
 }
-*/
+
+TEST(BlkQ4Fp16GemmPrepack, ColblockSmall) {
+  testPrepack<true>(32, 32);
+  testPrepack<true>(32, 32, false);
+}
+
+TEST(BlkQ4Fp16GemmPrepack, Rowblock) {
+  testPrepack<false>(32, 64);
+  testPrepack<false>(32, 128);
+  testPrepack<false>(32, 256);
+  testPrepack<false>(64, 32);
+  testPrepack<false>(128, 32);
+  testPrepack<false>(256, 32);
+  testPrepack<false>(256, 256);
+  testPrepack<false>(32, 128, false);
+  testPrepack<false>(128, 32, false);
+  testPrepack<false>(256, 256, false);
+}
+
+TEST(BlkQ4Fp16GemmPrepack, Colblock) {
+  testPrepack<true>(32, 64);
+  testPrepack<true>(32, 128);
+  testPrepack<true>(32, 256);
+  testPrepack<true>(64, 32);
+  testPrepack<true>(128, 32);
+  testPrepack<true>(256, 32);
+  testPrepack<true>(256, 256);
+  testPrepack<true>(32, 128, false);
+  testPrepack<true>(128, 32, false);
+  testPrepack<true>(256, 256, false);
+}
 
 }  // namespace test
 }  // namespace onnxruntime
 
 
-
-// TODO: code runs on CPU, but this is for sm80 only, maybe enable only when test on sm80
-int main(int argc, char** argv) {
-
-  onnxruntime::test::testPrepack<false>(32, 32);
-  onnxruntime::test::testPrepack<false>(32, 32, false);
-  onnxruntime::test::testPrepack<true>(32, 32);
-  onnxruntime::test::testPrepack<true>(32, 32, false);
-
-  onnxruntime::test::testPrepack<false>(32, 64);
-  onnxruntime::test::testPrepack<false>(32, 128);
-  onnxruntime::test::testPrepack<false>(32, 256);
-  onnxruntime::test::testPrepack<false>(64, 32);
-  onnxruntime::test::testPrepack<false>(128, 32);
-  onnxruntime::test::testPrepack<false>(256, 32);
-  onnxruntime::test::testPrepack<false>(256, 256);
-  onnxruntime::test::testPrepack<false>(32, 128, false);
-  onnxruntime::test::testPrepack<false>(128, 32, false);
-  onnxruntime::test::testPrepack<false>(256, 256, false);
-
-  onnxruntime::test::testPrepack<true>(32, 64);
-  onnxruntime::test::testPrepack<true>(32, 128);
-  onnxruntime::test::testPrepack<true>(32, 256);
-  onnxruntime::test::testPrepack<true>(64, 32);
-  onnxruntime::test::testPrepack<true>(128, 32);
-  onnxruntime::test::testPrepack<true>(256, 32);
-  onnxruntime::test::testPrepack<true>(256, 256);
-  onnxruntime::test::testPrepack<true>(32, 128, false);
-  onnxruntime::test::testPrepack<true>(128, 32, false);
-  onnxruntime::test::testPrepack<true>(256, 256, false);
-  return 0;
-}
