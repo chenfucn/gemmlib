@@ -52,7 +52,9 @@ target_include_directories(gemmlib PUBLIC ${INC_PATH})
 
 enable_testing()
 
-add_executable(gemmtest ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu)
+add_executable(gemmtest
+  ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_quant_sm80_test.cu
+  ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu)
 target_include_directories(gemmtest PUBLIC ${INC_PATH})
 
 target_link_libraries(gemmtest PRIVATE gemmlib GTest::gtest_main)

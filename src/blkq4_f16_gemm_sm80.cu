@@ -260,6 +260,10 @@ std::string blkq4_quant_sm80(
              + " expected: " + std::to_string(meta_shape.product());
     }
   }
+  if (weights.size() < columns * leadingDimension) {
+    return "Unexpected weight tensor size: " + std::to_string(weights.size())
+           + " expected: " + std::to_string(columns * leadingDimension);
+  }
 
   // allocate temp device memory for quantized weights and meta data, for prepacking
   auto quant_weights_dev_ptr = make_cuda_unique<ElementW>(q_weight_shape.product());

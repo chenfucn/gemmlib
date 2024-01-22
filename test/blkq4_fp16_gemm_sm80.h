@@ -21,19 +21,34 @@ namespace onnxruntime {
 namespace cuda {
 namespace test {
 
+// Pytorch linear layer stores the weight matrix in shape (out_features, in_features)
+// The input matrix should be in shape (batch_size, in_features). The output matrix
+// is in shape (batch_size, out_features).
+//
+// In blas M, N, K notation, where we have matrix multiplication:
+//    C = A * B
+// where A is the input matrix in shape (M, K), B is the weight matrix in shape (K, N),
+// and C is the output matrix in shape (M, N)
+// M = batch_size, N = out_features, K = in_features
+//
+// So B the weight matrix is in shape (K, N) = (in_features, out_features)
+// The weight matrix in Pytorch linear layer can be seen as the transpose of B,
+// i.e. column major layout of B.
+
+
 static inline void prepack_weights_ref(
-    int rows,
-    int columns,
+    int in_features,
+    int out_features,
     const mickey::MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, true>& tensor_weight,
     const mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true>& tensor_weight_prepacked) {
-  if (tensor_weight.shape()[0] != rows / 2 || tensor_weight.shape()[1] != columns) {
+  if (tensor_weight.shape()[0] != in_features / 2 || tensor_weight.shape()[1] != out_features) {
     throw std::runtime_error("Unexpected tensor_weight shape! Expected: (" +
-                             std::to_string(rows / 2) + ", " + std::to_string(columns) + "), Got: (" +
+                             std::to_string(in_features / 2) + ", " + std::to_string(out_features) + "), Got: (" +
                              std::to_string(tensor_weight.shape()[0]) + ", " + std::to_string(tensor_weight.shape()[1]) + ").");
   }
-  if (tensor_weight_prepacked.shape()[0] != rows || tensor_weight_prepacked.shape()[1] != columns / 2) {
+  if (tensor_weight_prepacked.shape()[0] != in_features || tensor_weight_prepacked.shape()[1] != out_features / 2) {
     throw std::runtime_error("Unexpected tensor_weight_prepacked shape! Expected: (" +
-                             std::to_string(rows) + ", " + std::to_string(columns / 2) + "), Got: (" +
+                             std::to_string(in_features) + ", " + std::to_string(out_features / 2) + "), Got: (" +
                              std::to_string(tensor_weight_prepacked.shape()[0]) + ", " + std::to_string(tensor_weight_prepacked.shape()[1]) + ").");
   }
 
@@ -41,8 +56,8 @@ static inline void prepack_weights_ref(
   auto t1_base = cutlass::make_Coord(4, 0);
   auto t2_base = cutlass::make_Coord(0, 8);
   auto t3_base = cutlass::make_Coord(4, 8);
-  for (int col_dtile = 0; col_dtile < columns / 16; ++col_dtile) {
-    for (int row_dtile = 0; row_dtile < rows / 16; ++row_dtile) {
+  for (int col_dtile = 0; col_dtile < out_features / 16; ++col_dtile) {
+    for (int row_dtile = 0; row_dtile < in_features / 16; ++row_dtile) {
       // Packing from a 8x16 tile to a 16x8 tile
       auto dtile_base = cutlass::make_Coord(row_dtile * 8, col_dtile * 16);
       auto packed_tile_base = cutlass::make_Coord(row_dtile * 16, col_dtile * 8);
@@ -75,18 +90,18 @@ template <
     typename Layout,
     typename QuantBlocking>
 void prepack_quant_scales_ref(
-    int rows,
-    int columns,
+    int in_features,
+    int out_features,
     const mickey::MatrixRef<ScaleElementT const, Layout, true>& tensor_scale,
     const mickey::MatrixRef<ScaleElementT, Layout, true>& tensor_scale_prepacked) {
-  if (tensor_scale.shape()[0] != (rows / QuantBlocking::kRow) || tensor_scale.shape()[1] != (columns / QuantBlocking::kColumn)) {
+  if (tensor_scale.shape()[0] != (in_features / QuantBlocking::kRow) || tensor_scale.shape()[1] != (out_features / QuantBlocking::kColumn)) {
     throw std::runtime_error("Unexpected tensor_scale shape! Expected: (" +
-                             std::to_string(rows / QuantBlocking::kRow) + ", " + std::to_string(columns / QuantBlocking::kColumn) + "), Got: (" +
+                             std::to_string(in_features / QuantBlocking::kRow) + ", " + std::to_string(out_features / QuantBlocking::kColumn) + "), Got: (" +
                              std::to_string(tensor_scale.shape()[0]) + ", " + std::to_string(tensor_scale.shape()[1]) + ").");
   }
   if (tensor_scale_prepacked.shape() != tensor_scale.shape()) {
     throw std::runtime_error("Unexpected tensor_scale_prepacked shape! Expected: (" +
-                             std::to_string(rows / QuantBlocking::kRow) + ", " + std::to_string(columns / QuantBlocking::kColumn) + "), Got: (" +
+                             std::to_string(in_features / QuantBlocking::kRow) + ", " + std::to_string(out_features / QuantBlocking::kColumn) + "), Got: (" +
                              std::to_string(tensor_scale_prepacked.shape()[0]) + ", " + std::to_string(tensor_scale_prepacked.shape()[1]) + ").");
   }
 
@@ -142,18 +157,18 @@ void prepack_quant_scales_ref(
 
 template <typename Layout, typename QuantBlocking>
 void prepack_quant_offsets_ref(
-    int rows,
-    int columns,
+    int in_features,
+    int out_features,
     mickey::MatrixRef<uint8_t const, Layout, true> tensor_offset,
     mickey::MatrixRef<uint8_t, Layout, true> tensor_offset_prepacked) {
-  if (tensor_offset.shape()[0] != (rows / QuantBlocking::kRow) || tensor_offset.shape()[1] != (columns / QuantBlocking::kColumn)) {
+  if (tensor_offset.shape()[0] != (in_features / QuantBlocking::kRow) || tensor_offset.shape()[1] != (out_features / QuantBlocking::kColumn)) {
     throw std::runtime_error("Unexpected tensor_offset shape! Expected: (" +
-                             std::to_string(rows / QuantBlocking::kRow) + ", " + std::to_string(columns / QuantBlocking::kColumn) + "), Got: (" +
+                             std::to_string(in_features / QuantBlocking::kRow) + ", " + std::to_string(out_features / QuantBlocking::kColumn) + "), Got: (" +
                              std::to_string(tensor_offset.shape()[0]) + ", " + std::to_string(tensor_offset.shape()[1]) + ").");
   }
   if (tensor_offset_prepacked.shape() != tensor_offset.shape()) {
     throw std::runtime_error("Unexpected tensor_offset_prepacked shape! Expected: (" +
-                             std::to_string(rows / QuantBlocking::kRow) + ", " + std::to_string(columns / QuantBlocking::kColumn) + "), Got: (" +
+                             std::to_string(in_features / QuantBlocking::kRow) + ", " + std::to_string(out_features / QuantBlocking::kColumn) + "), Got: (" +
                              std::to_string(tensor_offset_prepacked.shape()[0]) + ", " + std::to_string(tensor_offset_prepacked.shape()[1]) + ").");
   }
 

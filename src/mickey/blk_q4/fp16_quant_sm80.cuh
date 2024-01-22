@@ -252,10 +252,10 @@ struct BlockwiseQuantization {
    * @param[out] dst           pointer to the quantized weights, column major: [columns, rows]
    * @param[out] scale         pointer to the scales, column major: [columns/QuantBlk::kColumn, rows/QuantBlk::kRow]
    * @param[out] zero_points   pointer to the zero points, same shape as scale
-   * @param[in]  src           pointer to the source matrix, row major: [rows, columns]
+   * @param[in]  src           pointer to the source matrix, column major: [rows, columns]
    * @param rows
    * @param columns
-   * @param leadingDimension   stride of the source matrix, i.e. distance from one row to the next
+   * @param leadingDimension   stride of the source matrix, i.e. distance from one column to the next
    */
   CUTLASS_DEVICE
   static void dev_quantize_blk(
@@ -301,7 +301,7 @@ struct BlockwiseQuantization {
       const int row_end = ::min(row_start + QuantBlocking::kRow, r_end);
       for (int i = row_start; i < row_end; ++i) {
           for (int j = c; j < c_end; ++j) {
-              const float v = static_cast<float>(src[i * leadingDimension + j]);
+              const float v = static_cast<float>(src[i + j * leadingDimension]);
               if (v < min) min = v;
               if (v > max) max = v;
           }
@@ -327,7 +327,7 @@ struct BlockwiseQuantization {
         uint8_t zp = zero_points ? zero_points[meta_idx] : 8;
         float reciprocal_scale = scale ? 1.0f / scale : 0.0f;
 
-        const float v0 = static_cast<float>(src[i * leadingDimension + j]);
+        const float v0 = static_cast<float>(src[i + j * leadingDimension]);
         const uint8_t vi0 = (uint8_t)clamp(roundf(v0 * reciprocal_scale + zp),
                                                 0.0f, BitsTraits<qbits>::kMaxFp);
 
@@ -338,7 +338,7 @@ struct BlockwiseQuantization {
               reciprocal_scale = scale ? 1.0f / scale : 0.0f;
               zp = zero_points ? zero_points[meta_idx + 1] : 8;
           }
-          const float v1 = static_cast<float>(src[(i + 1) * leadingDimension + j]);
+          const float v1 = static_cast<float>(src[(i + 1) + j * leadingDimension]);
           vi1 = (uint8_t)clamp(roundf(v1 * reciprocal_scale + zp), 0.0f,
                                     BitsTraits<qbits>::kMaxFp);
         }
@@ -499,7 +499,7 @@ struct BlockwiseQuantization {
     uint8_t* offsets_prepacked, // <- quant offsets prepacked, double
     size_t buf_size
   ) {
-    int row_blk = blockIdx.x * blockDim.x + threadIdx.x * 16;
+    int row_blk = (blockIdx.x * blockDim.x + threadIdx.x) * 16;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row_blk >= meta_rows || col >= meta_columns) {
       return;
