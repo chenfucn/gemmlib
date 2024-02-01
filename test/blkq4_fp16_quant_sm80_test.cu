@@ -19,7 +19,7 @@
 #include "blk_q4/fp16_quant_sm80.cuh"
 #include "blkq4_fp16_gemm_sm80.h"
 
-#include "gemmlib.h"
+#include "ms_blkq4gemm.h"
 
 #include "gtest/gtest.h"
 

@@ -11,7 +11,7 @@
  *   well with gtest headers.
  */
 
-#include "gemmlib.h"
+#include "ms_blkq4gemm.h"
 #include "matrix_layout.h"
 #include "blk_q4/f16_gemm_sm80.h"
 #include "blkq4_fp16_gemm_sm80.h"

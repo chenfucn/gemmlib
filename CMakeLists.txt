@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CUDA_ARCHITECTURES 80)
 
 # Set the project name
-project(gemmlib LANGUAGES CUDA CXX)
+project(ms_blkq4gemm_proj LANGUAGES CUDA CXX)
 
 set(CUTLASS_NVCC_ARCHS "80;90a")
 
@@ -45,19 +45,19 @@ list(APPEND INC_PATH ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${cutlass_SOURCE_
 
 message(STATUS "include paths: ${INC_PATH}")
 
-add_library(gemmlib ${PROJECT_SOURCE_DIR}/src/blkq4_f16_gemm_sm80.cu)
-target_include_directories(gemmlib PUBLIC ${INC_PATH})
+add_library(ms_blkq4gemm ${PROJECT_SOURCE_DIR}/src/blkq4_f16_gemm_sm80.cu)
+target_include_directories(ms_blkq4gemm PUBLIC ${INC_PATH})
 
 # Tests
 
 enable_testing()
 
-add_executable(gemmtest
+add_executable(ms_blkq4gemm_test
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_quant_sm80_test.cu
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu)
-target_include_directories(gemmtest PUBLIC ${INC_PATH})
+target_include_directories(ms_blkq4gemm_test PUBLIC ${INC_PATH})
 
-target_link_libraries(gemmtest PRIVATE gemmlib GTest::gtest_main)
+target_link_libraries(ms_blkq4gemm_test PRIVATE ms_blkq4gemm GTest::gtest_main)
 
 include(GoogleTest)
-gtest_discover_tests(gemmtest)
+gtest_discover_tests(ms_blkq4gemm_test)
