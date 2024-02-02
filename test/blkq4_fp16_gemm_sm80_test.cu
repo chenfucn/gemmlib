@@ -343,15 +343,17 @@ void run_blkq4_gemm(int m, int n, int k) {
   uint8_t *o_zp_dev_ptr = nullptr;
   cudaMalloc(&o_zp_dev_ptr, q_meta_shape.product() * sizeof(uint8_t));
 
-  auto err = mickey::blkq4_fp16_quant_sm80_dispatch(
+  auto err = mickey::blkq4_fp16_quant_sm80(
     block_size,
     column_wise_blocking,
     problem_size.k(), problem_size.n(), problem_size.k(),
     0,
-    gsl::make_span(reinterpret_cast<half const*>(tensor_b.device_data()), tensor_b.size()),
-    gsl::make_span(o_elements_dev_ptr, q_weight_shape.product()),
-    gsl::make_span(reinterpret_cast<half*>(o_scales_dev_ptr), q_meta_shape.product()),
-    has_offsets ? gsl::make_span(o_zp_dev_ptr, q_meta_shape.product()) : gsl::span<uint8_t>()); 
+    tensor_b.device_data(), tensor_b.size() * sizeof(ElementInputB),
+    o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
+    o_scales_dev_ptr, q_meta_shape.product() * sizeof(ElementInputB),
+    has_offsets ? o_zp_dev_ptr : nullptr,
+    has_offsets ? (q_meta_shape.product() * sizeof(uint8_t)) : 0);
+  ASSERT_TRUE(err.empty()) << "Quantization failed: " << err;
 
 #if 0
 
@@ -414,48 +416,22 @@ void run_blkq4_gemm(int m, int n, int k) {
   tensor_a.sync_device();
   tensor_c.sync_device();
   tensor_d.sync_device();
-  cutlass::TensorRef<ElementWPack const, LayoutInputWPack> ref_W(
-    reinterpret_cast<ElementWPack const *>(o_elements_dev_ptr),
-    LayoutInputWPack::packed({problem_size.k()/2, problem_size.n()/2}));
-  cutlass::TensorRef<ElementQScale const, LayoutInputQScale> ref_scales(
-    reinterpret_cast<ElementQScale const *>(o_scales_dev_ptr),
-    LayoutInputQScale::packed({problem_size.k()/QuantBlocking::kRow, problem_size.n()/QuantBlocking::kColumn}));
-  cutlass::TensorRef<ElementQOffset const, LayoutInputQScale> ref_offsets(
-    o_zp_dev_ptr,
-    LayoutInputQScale::packed({problem_size.k()/QuantBlocking::kRow, problem_size.n()/QuantBlocking::kColumn}));
 
-  // Construct events
-  cudaEvent_t finish_gemm_event;
-  auto cuda_err = cudaEventCreate(&finish_gemm_event);
-  ASSERT_EQ(cuda_err, cudaSuccess) << "Failed to create CUDA event: " << cudaGetErrorString(cuda_err);
+  // Launch the CUTLASS kernel
+  err = mickey::blkq4_fp16_gemm_sm80(
+    block_size,
+    column_wise_blocking,
+    problem_size.m(), problem_size.n(), problem_size.k(),
+    0,
+    tensor_a.device_data(), tensor_a.size() * sizeof(ElementInputA),
+    o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
+    o_scales_dev_ptr, q_meta_shape.product() * sizeof(ElementInputB),
+    has_offsets ? o_zp_dev_ptr : nullptr, has_offsets ? (q_meta_shape.product() * sizeof(uint8_t)) : 0,
+    tensor_d.device_data(), tensor_d.size() * sizeof(ElementOutput));
 
-  // run GEMM
-  cutlass::Status status;
-  if constexpr (has_offsets){
-    status = GemmRunner::run(
-      nullptr, problem_size, tensor_a.device_ref(), ref_W,
-      ref_scales, ref_offsets,
-      tensor_c.device_ref(), tensor_d.device_ref());
-  } else {
-    status = GemmRunner::run(
-      nullptr, problem_size, tensor_a.device_ref(), ref_W,
-      ref_scales,
-      tensor_c.device_ref(), tensor_d.device_ref());
-  }
-  ASSERT_EQ(status, cutlass::Status::kSuccess) << "Kernel execution failed: " << cutlassGetStatusString(status);
+  ASSERT_TRUE(err.empty()) << "Kernel execution failed: " << err;
 
-  // Record an event when the GEMMs are complete
-  cuda_err = cudaEventRecord(finish_gemm_event);
-  ASSERT_EQ(cuda_err, cudaSuccess) << "Failed to record CUDA event: " << cudaGetErrorString(cuda_err);
-
-  // Wait for work on the device to complete.
-  cuda_err = cudaEventSynchronize(finish_gemm_event);
-  ASSERT_EQ(cuda_err, cudaSuccess) << "Failure during sync CUDA event: " << cudaGetErrorString(cuda_err);
-
-  cudaEventDestroy(finish_gemm_event);
-
-  // Preparing reference kernel arguments
-
+  // Run reference kernel
   cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_ref_d(
       problem_size.mn());  // <- Create matrix D with dimensions M x N used to store output from
                            // reference kernel

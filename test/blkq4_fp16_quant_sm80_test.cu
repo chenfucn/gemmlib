@@ -16,7 +16,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "blk_q4/fp16_quant_sm80.cuh"
+#include "blk_q4/f16_quant_sm80.cuh"
 #include "blkq4_fp16_gemm_sm80.h"
 
 #include "ms_blkq4gemm.h"
@@ -200,15 +200,17 @@ void testPrepack(int rows, int columns) {
   cudaMalloc(&dequants_dev_ptr, rows * columns * sizeof(ElementT));
   cudaMemcpy(dequants_dev_ptr, dequants.data(), rows * columns * sizeof(ElementT), cudaMemcpyHostToDevice);
 
-  auto err = mickey::blkq4_fp16_quant_sm80_dispatch(
+  auto err = mickey::blkq4_fp16_quant_sm80(
     block_size,
     ColumnQuantBlocking,
     rows, columns, rows,
     0,
-    gsl::make_span(dequants_dev_ptr, rows * columns),
-    gsl::make_span(o_elements_dev_ptr, q_weight_shape.product()),
-    gsl::make_span(o_scales_dev_ptr, meta_shape.product()),
-    has_offset ? gsl::make_span(o_zp_dev_ptr, meta_shape.product()) : gsl::span<uint8_t>()); 
+    dequants_dev_ptr, rows * columns * sizeof(ElementT),
+    o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
+    o_scales_dev_ptr, meta_shape.product() * sizeof(ElementT),
+    has_offset ? o_zp_dev_ptr : nullptr,
+    has_offset ? (meta_shape.product() * sizeof(uint8_t)) : 0); 
+  ASSERT_TRUE(err.empty()) << "Quantization Failed: " << err;
 
   //
   // Copy results from device to host
@@ -297,37 +299,37 @@ void testPrepack(int rows, int columns) {
 }
 
 TEST(BlkQ4Fp16GemmPrepack, RowblockSmall) {
-  testPrepack<false>(32, 32);
-  testPrepack<false, false>(32, 32);
+  testPrepack<false>(64, 32);
+  testPrepack<false, false>(64, 32);
 }
 
 TEST(BlkQ4Fp16GemmPrepack, ColblockSmall) {
-  testPrepack<true>(32, 32);
-  testPrepack<true, false>(32, 32);
+  testPrepack<true>(64, 32);
+  testPrepack<true, false>(64, 32);
 }
 
 TEST(BlkQ4Fp16GemmPrepack, Rowblock) {
-  testPrepack<false>(32, 64);
-  testPrepack<false>(32, 128);
-  testPrepack<false>(32, 256);
   testPrepack<false>(64, 32);
+  testPrepack<false>(64, 64);
+  testPrepack<false>(64, 128);
+  testPrepack<false>(64, 256);
   testPrepack<false>(128, 32);
   testPrepack<false>(256, 32);
   testPrepack<false>(256, 256);
-  testPrepack<false, false>(32, 128);
+  testPrepack<false, false>(64, 128);
   testPrepack<false, false>(128, 32);
   testPrepack<false, false>(256, 256);
 }
 
 TEST(BlkQ4Fp16GemmPrepack, Colblock) {
-  testPrepack<true>(32, 64);
-  testPrepack<true>(32, 128);
-  testPrepack<true>(32, 256);
   testPrepack<true>(64, 32);
+  testPrepack<true>(64, 64);
+  testPrepack<true>(64, 128);
+  testPrepack<true>(64, 256);
   testPrepack<true>(128, 32);
   testPrepack<true>(256, 32);
   testPrepack<true>(256, 256);
-  testPrepack<true, false>(32, 128);
+  testPrepack<true, false>(64, 128);
   testPrepack<true, false>(128, 32);
   testPrepack<true, false>(256, 256);
 }

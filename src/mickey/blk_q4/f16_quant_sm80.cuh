@@ -3,7 +3,7 @@
  * Licensed under the MIT License.
  *
  * Module Name:
- *    blk_q4/fp16_quant_sm80.h
+ *    blk_q4/f16_quant_sm80.cuh
  *
  * Abstract:
  *    Prepack weights and quantization parameters (scales and offsets) for
@@ -22,41 +22,6 @@
 #include "matrix_layout.h"
 
 namespace mickey {
-
-namespace details {
-
-static inline bool IsSm80WithWholeBlocks(int weight_rows, int weight_cols, int major, [[maybe_unused]] int minor) {
-  if (major < 8) {
-    return false;
-  }
-  return (weight_rows % 64 == 0) && (weight_cols % 64 == 0);
-}
-
-}  // namespace details
-
-template<typename ElementT, int block_size, int qbits>
-inline
-bool BlkQuantGemmSm80Supported(int weight_rows, int weight_cols, int major, int minor) {
-  return false;
-}
-
-template<>
-inline
-bool BlkQuantGemmSm80Supported<half, 16, 4>(int weight_rows, int weight_cols, int major, int minor) {
-  return details::IsSm80WithWholeBlocks(weight_rows, weight_cols, major, minor);
-}
-
-template<>
-inline
-bool BlkQuantGemmSm80Supported<half, 32, 4>(int weight_rows, int weight_cols, int major, int minor) {
-  return details::IsSm80WithWholeBlocks(weight_rows, weight_cols, major, minor);
-}
-
-template<>
-inline
-bool BlkQuantGemmSm80Supported<half, 64, 4>(int weight_rows, int weight_cols, int major, int minor) {
-  return details::IsSm80WithWholeBlocks(weight_rows, weight_cols, major, minor);
-}
 
 template <
     typename ElementT,
@@ -252,7 +217,7 @@ struct BlockwiseQuantization {
    * @param[out] dst           pointer to the quantized weights, column major: [columns, rows]
    * @param[out] scale         pointer to the scales, column major: [columns/QuantBlk::kColumn, rows/QuantBlk::kRow]
    * @param[out] zero_points   pointer to the zero points, same shape as scale
-   * @param[in]  src           pointer to the source matrix, column major: [rows, columns]
+   * @param[in]  src           pointer to the source matrix, column major: [columns, rows]
    * @param rows
    * @param columns
    * @param leadingDimension   stride of the source matrix, i.e. distance from one column to the next
