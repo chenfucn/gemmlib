@@ -1,3 +1,7 @@
+/**
+ * Copyright (c) Microsoft Corporation. All rights reserved.
+*/
+
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -22,13 +26,14 @@ std::vector<torch::Tensor> blkq4linear_quant(
   int64_t out_features = shape[0];
   int64_t in_features = shape[1];
 
+  std::string err_message;
   // Compute the size of the quantized weights and metadata
   int64_t quant_weights_size;
   int64_t quant_meta_size;
-  auto err = mickey::blkq4_fp16_quant_size_sm80(
+  auto err = blkq4_fp16_quant_size_sm80(
     block_size, col_wise, in_features, out_features,
-    quant_weights_size, quant_meta_size);
-  TORCH_CHECK(err.empty(), err);
+    quant_weights_size, quant_meta_size, &err_message);
+  TORCH_CHECK(err == 0, err_message);
 
   if (weights.device().type() == at::kCUDA) {
     const int64_t g_idx = weights.device().index();
@@ -48,18 +53,19 @@ std::vector<torch::Tensor> blkq4linear_quant(
       q_zp_byte_size = quant_meta_size * sizeof(uint8_t);
     }
 
-    auto err = mickey::blkq4_fp16_quant_sm80(
+    auto err = blkq4_fp16_quant_sm80(
       int(block_size), bool(col_wise), int(in_features), int(out_features), int(in_features),
       nullptr, // specify stream?
       weights.data_ptr(), weights_size * half_t_size,
       q_weights.data_ptr(), quant_weights_size * sizeof(uint8_t),
       q_scales.data_ptr(), quant_meta_size * half_t_size,
-      q_zp_ptr, q_zp_byte_size);
+      q_zp_ptr, q_zp_byte_size,
+      &err_message);
 
-    TORCH_CHECK(err.empty(), err);
+    TORCH_CHECK(err == 0, err_message);
     return {q_weights, q_scales, q_zp};
   } else {
-    TORCH_CHECK(false, "blkq4linear_quant only supports CUDA tensors");
+    TORCH_CHECK(false, "blkq4linear_quant only supports CUDA tensors, instead got ", weights.device().str());
   }
 
   return {};
@@ -95,15 +101,17 @@ torch::Tensor blkq4linear_forward(
     q_zp_ptr = q_zp.data_ptr();
   }
   
-  auto err = mickey::blkq4_fp16_gemm_sm80(
+  std::string err_message;
+  auto err = blkq4_fp16_gemm_sm80(
     block_size, col_wise, int(a_shape[0]), out_features, in_features,
     nullptr, // specify stream?
     input.data_ptr(), input.numel() * half_t_size,
     q_weights.data_ptr(), q_weights.numel() * sizeof(uint8_t),
     q_scales.data_ptr(), q_scales.numel() * half_t_size,
     q_zp_ptr, zp_size * sizeof(uint8_t),
-    q_output.data_ptr(), q_output.numel() * half_t_size);
-  TORCH_CHECK(err.empty(), err);
+    q_output.data_ptr(), q_output.numel() * half_t_size,
+    &err_message);
+  TORCH_CHECK(err == 0, err_message);
 
   return q_output;
 }

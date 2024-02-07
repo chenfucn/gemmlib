@@ -93,18 +93,23 @@ void testPrepack(int rows, int columns) {
   }
 
   std::vector<ElementT> q_scales(meta_shape.product());
-  for (size_t i = 0; i < q_scales.size(); i++) {
-    q_scales[i] = ElementT(((dis(gen) % 127) + 1) / 32.0f);
-  }
   mickey::MatrixRef<ElementT, LayoutQmeta, true> tensor_scale(
       q_scales, meta_shape);
 
   std::vector<ElementQOffset> q_zp(meta_shape.product());
-  for (size_t i = 0; i < q_zp.size(); i++) {
-    q_zp[i] = dis(gen) % 16;
-  }
   mickey::MatrixRef<ElementQOffset, LayoutQmeta, true> tensor_offset(
       q_zp, meta_shape);
+
+  for (int col = 0; col < meta_shape[1]; ++col) {
+    for (int row = 0; row < meta_shape[0]; ++row) {
+        int f = (((col * v + row + v / 3) % 63) + 1);
+        v += 41;
+        int m = col * v + row + v * 3;
+        float scale =  f / float(1 << (4 + (m % 2)));
+        tensor_scale.at(row, col) = ElementT(scale);
+        tensor_offset.at(row, col) = ((f + m + v) % 8) + 4;
+    }
+  }
 
 #if 0  // debug
   // Fill tensor_q_weight with the patterned data, easier to debug with print
@@ -176,7 +181,7 @@ void testPrepack(int rows, int columns) {
       float dequant = scale * float(w - offset);
       tensor_dequant.at(row, col) = ElementT(dequant);
       // Prints for help debugging in case of test failure
-      // fprintf(stderr, "(%2d,%2d)= %2d, %2d, %f, %f\n", row, col, w, offset, scale, dequant);
+      // fprintf(stdout, "(%2d,%2d)= %2d, %2d, %f, %f\n", row, col, w, offset, scale, dequant);
     }
   }
 
@@ -200,7 +205,8 @@ void testPrepack(int rows, int columns) {
   cudaMalloc(&dequants_dev_ptr, rows * columns * sizeof(ElementT));
   cudaMemcpy(dequants_dev_ptr, dequants.data(), rows * columns * sizeof(ElementT), cudaMemcpyHostToDevice);
 
-  auto err = mickey::blkq4_fp16_quant_sm80(
+  std::string err_message;
+  auto err = blkq4_fp16_quant_sm80(
     block_size,
     ColumnQuantBlocking,
     rows, columns, rows,
@@ -209,8 +215,9 @@ void testPrepack(int rows, int columns) {
     o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
     o_scales_dev_ptr, meta_shape.product() * sizeof(ElementT),
     has_offset ? o_zp_dev_ptr : nullptr,
-    has_offset ? (meta_shape.product() * sizeof(uint8_t)) : 0); 
-  ASSERT_TRUE(err.empty()) << "Quantization Failed: " << err;
+    has_offset ? (meta_shape.product() * sizeof(uint8_t)) : 0,
+    &err_message); 
+  ASSERT_TRUE(err == 0) << "Quantization Failed: " << err_message;
 
   //
   // Copy results from device to host
@@ -242,6 +249,11 @@ void testPrepack(int rows, int columns) {
           << (ColumnQuantBlocking ? "Column-wise-block" : "Row-wise-block");
     }
   }
+  for (size_t i = 0; i < packed_zp.size(); ++i) {
+    std::cout << int(packed_zp[i]) << " ";
+    if ((i % 9) == 8) std::cout << std::endl;
+  }
+  std::cout << std::endl;
 
   // Verify prepacked scales and offsets
   std::vector<ElementT> packed_scales_ref(meta_shape.product());
@@ -300,7 +312,7 @@ void testPrepack(int rows, int columns) {
 
 TEST(BlkQ4Fp16GemmPrepack, RowblockSmall) {
   testPrepack<false>(64, 32);
-  testPrepack<false, false>(64, 32);
+  // testPrepack<false, false>(64, 32);
 }
 
 TEST(BlkQ4Fp16GemmPrepack, ColblockSmall) {

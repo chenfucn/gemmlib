@@ -48,6 +48,11 @@ message(STATUS "include paths: ${INC_PATH}")
 add_library(ms_blkq4gemm ${PROJECT_SOURCE_DIR}/src/blkq4_f16_gemm_sm80.cu)
 target_include_directories(ms_blkq4gemm PUBLIC ${INC_PATH})
 
+# Since we need to link this library to a shared library, to be loaded by python, we
+# have to use this to avoid the error: "relocation R_X86_64_32 against `some local symbol' can not be used when making a shared object; recompile with -fPIC"
+set_property(TARGET ms_blkq4gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+
 # Tests
 
 enable_testing()
@@ -61,3 +66,21 @@ target_link_libraries(ms_blkq4gemm_test PRIVATE ms_blkq4gemm GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(ms_blkq4gemm_test)
+
+
+#find_package(Python REQUIRED COMPONENTS Development)
+#find_package(Torch REQUIRED)
+
+#add_library(ms_blkq4linear_ext SHARED
+#  ${PROJECT_SOURCE_DIR}/src/blkq4_f16_gemm_sm80.cu
+#  ${PROJECT_SOURCE_DIR}/python/ms_blkq4linear_ext/ms_blkq4linear.cpp
+#)
+#target_compile_features(pytorch_cmake_example PRIVATE cxx_std_11)
+#target_include_directories(ms_blkq4linear_ext PUBLIC ${INC_PATH})
+#target_link_libraries(ms_blkq4linear_ext PRIVATE ${TORCH_LIBRARIES} Python::Python)
+
+# Use if the default GCC version gives issues
+#target_compile_options(pytorch_cmake_example PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-ccbin g++-9>)
+
+# Use a variant of this if you're on an earlier cmake than 3.18
+# target_compile_options(pytorch_cmake_example PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode arch=compute_61,code=sm_61>)

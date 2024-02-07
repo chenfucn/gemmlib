@@ -1,9 +1,19 @@
+/**
+ * Copyright (c) Microsoft Corporation. All rights reserved.
+*/
 
 #pragma once
 
-#include <string>
+/**
+ * Public API for the blockwise int4 quantization kernels.
+ * 
+ * Previous attempts to expose C++ interfaces to be used in Python
+ * have been unsuccessful. Python interpreters always complain about
+ * mangled names not found. As a workaround, we strip all the type
+ * information and use C-style interfaces.
+*/
 
-namespace mickey {
+extern "C" {
 
 /**
  * @brief Compute fp16 GEMM where the weight tensor is blockwise
@@ -25,8 +35,10 @@ namespace mickey {
  * @param[in]  offsets_size The byte size of the offsets.
  * @param[out] output_ptr The output tensor.
  * @param[in]  output_size The byte size of the output tensor.
+ * @param[out] error_message The error message (type: std::string*) if the kernel fails.
+ * @return 0 if the kernel runs successfully, -1 otherwise.
 */
-extern std::string blkq4_fp16_gemm_sm80(
+int blkq4_fp16_gemm_sm80(
   int block_size,
   bool column_wise_blocking,
   int m, int n, int k, void* stream,
@@ -34,7 +46,8 @@ extern std::string blkq4_fp16_gemm_sm80(
   void const* weights_ptr, size_t weights_size,
   void const* scales_ptr, size_t scales_size,
   void const* offsets_ptr, size_t offsets_size,
-  void* output_ptr, size_t output_size);
+  void* output_ptr, size_t output_size,
+  void* error_message);
 
 /**
  * @brief Quantize a fp16 weight tensor to int4 using blockwise quantization.
@@ -52,8 +65,10 @@ extern std::string blkq4_fp16_gemm_sm80(
  * @param[in]  quant_scales_size The byte size of the scales.
  * @param[out] offsets The offsets for the quantized weight tensor.
  * @param[in]  offsets_size The byte size of the offsets.
+ * @param[out] error_message The error message (type: std::string*) if the kernel fails.
+ * @return 0 if the kernel runs successfully, -1 otherwise.
  */
-extern std::string blkq4_fp16_quant_sm80(
+extern int blkq4_fp16_quant_sm80(
     int block_size,
     bool column_wise_blocking,
     int rows, int columns, int leadingDimension,
@@ -61,7 +76,8 @@ extern std::string blkq4_fp16_quant_sm80(
     void const* weights, size_t weights_size,
     void* quant_weights, size_t quant_weights_size,
     void* quant_scales, size_t quant_scales_size,
-    void* offsets, size_t offsets_size);
+    void* offsets, size_t offsets_size,
+    void* error_message);
 
 /**
  * @brief Compute the size of the quantized tensors for the blockwise quantization.
@@ -72,12 +88,15 @@ extern std::string blkq4_fp16_quant_sm80(
  * @param[in]  columns The number of output features.
  * @param[out] quant_weights_size The number of elements in the quantized weight tensor.
  * @param[out] quant_meta_size The number of elements in the quantized meta data tensor.
+ * @param[out] error_message The error message (type: std::string*) if the kernel fails.
+ * @return 0 if the kernel runs successfully, -1 otherwise.
 */
-extern std::string blkq4_fp16_quant_size_sm80(
+int blkq4_fp16_quant_size_sm80(
     int block_size,
     bool column_wise_blocking,
     int rows, int columns,
     int64_t& quant_weights_size,
-    int64_t& quant_meta_size);
+    int64_t& quant_meta_size,
+    void* error_message);
 
 }  // namespace mickey

@@ -1,4 +1,6 @@
-
+#
+# Copyright (c) Microsoft Corporation. All rights reserved.
+#
 
 import torch
 import torch.nn as nn
@@ -16,7 +18,7 @@ weights = layer1.weight.clone().detach()
 # numbers from a quantization block come from a single row
 # but keep in mind that weights are stored in column major, 
 col_wise = False
-block_size = 16
+block_size = 32
 scale_only = False
 
 block_rows = block_size if col_wise else 1
@@ -63,18 +65,23 @@ for c in range(out_features):
         w_r = r // 2
         scale_c = c // block_cols
         scale_r = r // block_rows
-        offset = q_zp[scale_c][scale_r]
+        offset = int(q_zp[scale_c][scale_r])
         w = 0
         if r % 2 == 0:
-            w = int(q_weights[c][w_r] & 0x0f) - offset
+            w = int(q_weights[c][w_r] & 0x0f)
         else:
-            w = int(q_weights[c][w_r] >> 4) - offset
-        weights[c][r] = q_scales[scale_c][scale_r] * w
+            w = int(q_weights[c][w_r] >> 4)
+        scale = float(q_scales[scale_c][scale_r])
+        weights[c][r] = scale * float(w - offset)
+        # print(f'({r},{c}) w={w}, offset={offset}, scale={scale}, {weights[c][r]}')
 
+
+weights = weights.to(torch.device('cuda:0'))
 
 blkq4l_module = ms_blkq4linear.BlkQ4Linear(block_size, col_wise, scale_only, weights)
 
-print(q_weights)
+torch.set_printoptions(profile="full")
 print(blkq4l_module.q_weights)
+torch.set_printoptions(profile="default")
 
 

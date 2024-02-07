@@ -343,7 +343,8 @@ void run_blkq4_gemm(int m, int n, int k) {
   uint8_t *o_zp_dev_ptr = nullptr;
   cudaMalloc(&o_zp_dev_ptr, q_meta_shape.product() * sizeof(uint8_t));
 
-  auto err = mickey::blkq4_fp16_quant_sm80(
+  std::string err_message;
+  auto err = blkq4_fp16_quant_sm80(
     block_size,
     column_wise_blocking,
     problem_size.k(), problem_size.n(), problem_size.k(),
@@ -352,8 +353,9 @@ void run_blkq4_gemm(int m, int n, int k) {
     o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
     o_scales_dev_ptr, q_meta_shape.product() * sizeof(ElementInputB),
     has_offsets ? o_zp_dev_ptr : nullptr,
-    has_offsets ? (q_meta_shape.product() * sizeof(uint8_t)) : 0);
-  ASSERT_TRUE(err.empty()) << "Quantization failed: " << err;
+    has_offsets ? (q_meta_shape.product() * sizeof(uint8_t)) : 0,
+    &err_message);
+  ASSERT_TRUE(err == 0) << "Quantization failed: " << err_message;
 
 #if 0
 
@@ -418,7 +420,7 @@ void run_blkq4_gemm(int m, int n, int k) {
   tensor_d.sync_device();
 
   // Launch the CUTLASS kernel
-  err = mickey::blkq4_fp16_gemm_sm80(
+  err = blkq4_fp16_gemm_sm80(
     block_size,
     column_wise_blocking,
     problem_size.m(), problem_size.n(), problem_size.k(),
@@ -427,9 +429,10 @@ void run_blkq4_gemm(int m, int n, int k) {
     o_elements_dev_ptr, q_weight_shape.product() * sizeof(ElementW),
     o_scales_dev_ptr, q_meta_shape.product() * sizeof(ElementInputB),
     has_offsets ? o_zp_dev_ptr : nullptr, has_offsets ? (q_meta_shape.product() * sizeof(uint8_t)) : 0,
-    tensor_d.device_data(), tensor_d.size() * sizeof(ElementOutput));
+    tensor_d.device_data(), tensor_d.size() * sizeof(ElementOutput),
+    &err_message);
 
-  ASSERT_TRUE(err.empty()) << "Kernel execution failed: " << err;
+  ASSERT_TRUE(err == 0) << "Kernel execution failed: " << err_message;
 
   // Run reference kernel
   cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_ref_d(

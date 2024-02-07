@@ -1,6 +1,8 @@
-import math
+#
+# Copyright (c) Microsoft Corporation. All rights reserved.
+#
+
 from torch import nn
-import torch
 
 import ms_blkq4linear_ext
 
@@ -15,6 +17,7 @@ class BlkQ4Linear(nn.Module):
         self.in_features = weights.size(1)
         self.out_features = weights.size(0)
 
+        print(weights.device)
         self.q_weights, self.q_scales, self.q_zp = ms_blkq4linear_ext.quant(block_size, col_wise, self.has_offsets, weights)
         self.bias = bias_tensor
 
