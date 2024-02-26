@@ -58,8 +58,10 @@ set_property(TARGET ms_blkq4gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
 enable_testing()
 
 add_executable(ms_blkq4gemm_test
+  ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_util.cu
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_quant_sm80_test.cu
-  ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu)
+  ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu
+  ${PROJECT_SOURCE_DIR}/test/tensor_core_tile_loader_test.cu)
 target_include_directories(ms_blkq4gemm_test PUBLIC ${INC_PATH})
 
 target_link_libraries(ms_blkq4gemm_test PRIVATE ms_blkq4gemm GTest::gtest_main)
