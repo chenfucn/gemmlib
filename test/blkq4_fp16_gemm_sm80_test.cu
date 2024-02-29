@@ -108,33 +108,6 @@ void compute_gemm_ref(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 //
-// Converting cutlass tensor to MatrixRef
-//
-
-template <
-  typename Element,
-  typename Layout>
-__forceinline__
-mickey::MatrixRef<Element, Layout, true> make_MatrixRef(cutlass::HostTensor<Element, Layout> const& tensor) {
-  static_assert(std::is_same<Layout, cutlass::layout::ColumnMajor>::value
-                || std::is_same<Layout, cutlass::layout::RowMajor>::value);
-  auto shape = cutlass::make_Coord(tensor.extent().row(), tensor.extent().column());
-  auto* ptr = const_cast<typename std::remove_const<Element>::type *>(tensor.host_data());
-  return mickey::MatrixRef<Element, Layout, true>(ptr, tensor.capacity(), shape);
-}
-
-template <
-  typename Element,
-  typename Layout>
-__forceinline__
-mickey::MatrixRef<Element const, Layout, true> make_ConstMatrixRef(cutlass::HostTensor<Element, Layout> const& tensor) {
-  static_assert(std::is_same<Layout, cutlass::layout::ColumnMajor>::value
-                || std::is_same<Layout, cutlass::layout::RowMajor>::value);
-  auto shape = cutlass::make_Coord(tensor.extent().row(), tensor.extent().column());
-  return mickey::MatrixRef<Element const, Layout, true>(tensor.host_data(), tensor.capacity(), shape);
-}
-
-//
 // Invoking the kernel
 //
 

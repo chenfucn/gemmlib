@@ -20,7 +20,15 @@
 #include "cutlass/util/debug.h"
 #include "cutlass/util/device_dump.h"
 
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+
+#include "matrix_layout.h"
+#include "blkq4_fp16_util.h"
+#include "blkq4_fp16_gemm_sm80.h"
+
 #include "gemm/warp/tensor_core_tile_loader.h"
+#include "gemm/warp/quantb_meta_loader.h"
 
 #include "gtest/gtest.h"
 
@@ -31,16 +39,6 @@ namespace cuda {
 namespace test {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
-CUTLASS_HOST_DEVICE
-constexpr int div_up(int a, int b) {
-  return (a + b - 1) / b;
-}
-
-CUTLASS_HOST_DEVICE
-constexpr int round_up(int a, int b) {
-  return div_up(a, b) * b;
-}
 
 template <
   typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
@@ -74,8 +72,8 @@ struct LoadPackedBTestKernel {
   using WarpPackedBShape = cutlass::gemm::GemmShape<1, WarpShape::kN/2, WarpShape::kK>;
 
   // decide per warp tile loader shape, it loads 1, 2 or 4 tiles at a time
-  static constexpr int kNTilesPerLoad = std::min(4, div_up(WarpPackedBShape::kN, 8));
-  static constexpr int kKTilesPerLoad = std::min(4/kNTilesPerLoad, div_up(WarpPackedBShape::kK, 16));
+  static constexpr int kNTilesPerLoad = std::min(4, WarpPackedBShape::kN / 8);
+  static constexpr int kKTilesPerLoad = std::min(4/kNTilesPerLoad, WarpPackedBShape::kK / 16);
   using PackedBLoader = mickey::gemm::warp::TensorCoreTileLoader<kNTilesPerLoad, kKTilesPerLoad>;
 
   static_assert((WarpPackedBShape::kN % PackedBLoader::kMNStride) == 0);
@@ -83,6 +81,8 @@ struct LoadPackedBTestKernel {
 
   static constexpr int kNloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
   static constexpr int kKloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
+
+  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, true>;
 
   static constexpr int kWarps = kSplitK; // TODO! more warps when we have a larger thread block shape
   static int const kThreadCount = 32 * kWarps;
@@ -133,10 +133,10 @@ struct LoadPackedBTestKernel {
       scales_byte_stride_(scales_byte_stride),
       ptr_offsets_(ptr_offsets),
       offsets_byte_stride_(offsets_byte_stride),
-      gemm_k_size_(round_up(div_up(problem_size.k(), kSplitK), WarpShape::kK)),
+      gemm_k_size_(mickey::round_up(mickey::div_up(problem_size.k(), kSplitK), WarpShape::kK)),
       // TODO! grid_tiled_shape_ should be based on thread block shape
       grid_tiled_shape_(cutlass::gemm::GemmCoord(
-        1, div_up(problem_size.n(), WarpShape::kN), 1
+        1, mickey::div_up(problem_size.n(), WarpShape::kN), 1
       )) { }
   };
 
@@ -268,8 +268,8 @@ struct LoadPackedBTestKernel {
 #endif
 
     // Fragments (hopefully in registers) for A and B
-    using FragmentPackedB = cutlass::Array<unsigned, PackedBLoader::kTiles>;
-    FragmentPackedB fragment_packed_b[kNloads];
+    using FragmentPackedB = cutlass::Array<unsigned, PackedBLoader::kTiles * kNloads * kKloads>;
+    FragmentPackedB fragment_packed_b;
 
     //
     // for gemm input B size (k,n), packed b is (k/2,n/2), element size 2, column major.
@@ -293,6 +293,15 @@ struct LoadPackedBTestKernel {
       k_end,
       lane_idx};
 
+    MetaLoader meta_loader{
+      lane_idx,
+      params.ptr_scales_,
+      params.scales_byte_stride_,
+      n_start, n_end};
+
+    typename MetaLoader::FragmentScales fragment_scales[kStages];
+    typename MetaLoader::FragmentB fragment_b;
+
     if constexpr (kDebugPrint) {
       if (lane_idx == 0) {
         printf("Warp: %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
@@ -314,6 +323,9 @@ struct LoadPackedBTestKernel {
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
       uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
 
+      meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
+
+      // Load packed b
       CUTLASS_PRAGMA_UNROLL
       for (int k_load = 0; k_load < kKloads; ++k_load) {
         packed_b_loader.load_to(packed_b_smem_ptr);
@@ -344,41 +356,33 @@ struct LoadPackedBTestKernel {
     //
     // Mainloop
     //
-    for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages){
+    for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages, proc_k += WarpShape::kK){
       uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr + smem_read_stage * SharedStorage::kPackedBSizePerIter;
       uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
+
+      meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
+      cutlass::Array<unsigned, PackedBLoader::kTiles>* packed_b_tile_frag_ptr =
+          reinterpret_cast<cutlass::Array<unsigned, PackedBLoader::kTiles>*>(fragment_packed_b.data());
+
+      // If PackedBLoader::kKStride > 16, then kNLoads must be 1. Because we don't want a
+      // over-complicated tile visiting pattern. We always want to visit the all the
+      // packed B tiles on the N dimension in a contiguous manner, and then move to the next
+      // K dimension.
+      static_assert(PackedBLoader::kKStride <= 16 || kNloads == 1);
 
       CUTLASS_PRAGMA_UNROLL
       for (int k_load = 0; k_load < kKloads; ++k_load) {
         CUTLASS_PRAGMA_UNROLL
-        for (int n_load = 0; n_load < kNloads; ++n_load) {
-          PackedBLoader::ldmatrix_sync(fragment_packed_b[n_load], lane_idx, packed_b_smem_read_ptr);
+        for (int n_load = 0; n_load < kNloads; ++n_load, ++packed_b_tile_frag_ptr) {
+          PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, lane_idx, packed_b_smem_read_ptr);
           packed_b_smem_read_ptr += PackedBLoader::kByteSize;
 
           if constexpr (kDebugPrint) {
-            uint8_t const* ptr = reinterpret_cast<uint8_t const*>(fragment_packed_b[n_load].data());
+            uint8_t const* ptr = reinterpret_cast<uint8_t const*>(packed_b_tile_frag_ptr->data());
             printf("Warp: %d, lane %2d, smem_read_ptr %p, %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d\n",
               warp_idx, lane_idx, packed_b_smem_read_ptr, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
           }
-
-          int n_idx = packed_n_start + n_load * PackedBLoader::kMNStride;
-          int tt = 0;
-          CUTLASS_PRAGMA_UNROLL
-          for (int t_k = 0; t_k < PackedBLoader::kKTiles; ++t_k) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int t_n = 0; t_n < PackedBLoader::kMNTiles; ++t_n, ++tt) {
-              int n = n_idx + t_n * 8 + lane_b_n_offset;
-              int k = proc_k + t_k * 16 + lane_b_k_offset * sizeof(unsigned);
-              if (n < packed_n_end && k < k_end) {
-                unsigned* dst = reinterpret_cast<unsigned*>(reinterpret_cast<uint8_t*>(params.ptr_output_) + n * params.output_byte_stride_ + k);
-                *dst = fragment_packed_b[n_load][tt];
-              }
-            }
-          }
-
         }
-
-        proc_k += PackedBLoader::kKStride;
 
         if (load_k < k_end) {
           packed_b_loader.load_to(packed_b_smem_write_ptr);
@@ -391,6 +395,26 @@ struct LoadPackedBTestKernel {
           ++packed_b_loader;
         }
         load_k += PackedBLoader::kKStride;
+      }
+
+      int tt = 0;
+      CUTLASS_PRAGMA_UNROLL
+      for (int pack_b_tile_k = 0; pack_b_tile_k < (WarpPackedBShape::kK/16); ++pack_b_tile_k) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int pack_b_tile_n = 0; pack_b_tile_n < (WarpPackedBShape::kN/8); ++pack_b_tile_n, ++tt) {
+          int n = packed_n_start + pack_b_tile_n * 8 + lane_b_n_offset;
+          int k = proc_k + pack_b_tile_k * 16 + lane_b_k_offset * sizeof(unsigned);
+          if (n < packed_n_end && k < k_end) {
+            unsigned* dst = reinterpret_cast<unsigned*>(reinterpret_cast<uint8_t*>(params.ptr_output_) + n * params.output_byte_stride_ + k);
+            *dst = fragment_packed_b[tt];
+          }
+        }
+      }
+      meta_loader.dequant(fragment_packed_b, fragment_scales[smem_read_stage], fragment_b);
+      if constexpr (kDebugPrint) {
+        for (int tile = 0; tile < (WarpShape::kK/8) * (WarpShape::kN/8); tile ++){
+          printf("Warp: %d, lane %d, B: %f, %f\n", warp_idx, lane_idx, float(fragment_b[tile * 2]), float(fragment_b[tile * 2 + 1]));
+        }
       }
 
       // Defines the boundary of a stage of cp.async.
@@ -431,12 +455,14 @@ class LoadPackedBTest {
   cutlass::Status run(
     cudaStream_t stream,
     cutlass::gemm::GemmCoord const & problem_size,
-    void const *ptr_packed_b,
-    int64_t b_byte_stride,
     void* ptr_output,
-    int64_t output_byte_stride) {
+    int output_byte_stride,
+    void const *ptr_packed_b,
+    int b_byte_stride,
+    void const *ptr_scales,
+    int scales_byte_stride) {
 
-    Args args(problem_size, ptr_output, output_byte_stride, ptr_packed_b, b_byte_stride, nullptr, 0);
+    Args args(problem_size, ptr_output, output_byte_stride, ptr_packed_b, b_byte_stride, ptr_scales, scales_byte_stride);
     cutlass::Status status = TestKernel::can_implement(args);
     if (status != cutlass::Status::kSuccess) {
       return status;
@@ -471,47 +497,94 @@ class LoadPackedBTest {
 
 template <typename WarpShape, int kSplitK, int kStages>
 void test_load_packed_b(int m, int n, int k) {
-  using Test = LoadPackedBTest<cutlass::MatrixShape<1,16>, WarpShape, kSplitK, kStages>;
+  std::cout << "Testing WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
+            << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
+  std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
+
+  using QuantBlocking = cutlass::MatrixShape<16, 1>;
+  using Test = LoadPackedBTest<QuantBlocking, WarpShape, kSplitK, kStages>;
   Test test;
   cutlass::gemm::GemmCoord problem_size(m, n, k);
-  cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> tensor_weight_prepacked(
-      cutlass::make_Coord(problem_size.k(), problem_size.n()/2));
-  cutlass::reference::host::TensorFillRandomUniform(tensor_weight_prepacked.host_view(), 51, 1, 250);
 
-  cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> q4_weights_copy(
-      cutlass::make_Coord(problem_size.k(), problem_size.n()/2));
-  cutlass::reference::host::TensorFill(q4_weights_copy.host_view(), uint8_t(0));
+  constexpr bool has_offsets = false;
+  using QuantBaseT = onnxruntime::test::BlkQuantizationRef<QuantBlocking, has_offsets>;
+  using LayoutQMeta = typename QuantBaseT::LayoutQMeta;
 
-  tensor_weight_prepacked.sync_device();
-  q4_weights_copy.sync_device();
+  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_b({k, n});
+  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 51, -1.75f, 1.9f);
+  cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> q4_weights;
+  cutlass::HostTensor<cutlass::half_t, LayoutQMeta> scales;
+  cutlass::HostTensor<uint8_t, LayoutQMeta> offsets;
 
-  cutlass::Status status = test.run(nullptr, problem_size, tensor_weight_prepacked.device_data(), problem_size.k(), q4_weights_copy.device_data(), problem_size.k());
+  QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
+  QuantBaseT::Dequantize4BitToFp16(tensor_b, q4_weights, scales, offsets);
+  QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
+  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> dst;
+  QuantBaseT::Dequantize4BitToFp16(dst, q4_weights, scales, offsets);
+
+  for (int col = 0; col < n; ++col) {
+    for (int row = 0; row < k; ++row) {
+      auto weight_pos = cutlass::make_Coord(row/2, col);
+      auto meta_pos = cutlass::make_Coord(row / QuantBlocking::kRow, col / QuantBlocking::kColumn);
+      const float scale = static_cast<float>(scales.at(meta_pos));
+      const uint8_t offset = has_offsets ? offsets.at(meta_pos) : 8;
+      const int w = (row % 2 == 0) ? (q4_weights.at(weight_pos) & 0xf) : (q4_weights.at(weight_pos) >> 4);
+
+      const float f = scale * (w - offset);
+      printf("%f=%2dx%f,  ", float(dst.at({row, col})), w, scale);
+      ASSERT_EQ(dst.at({row, col}), cutlass::half_t(f));
+    }
+    printf("\n");
+  }
+
+  std::vector<uint8_t> packed_w_ref(k * n / 2);
+  mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_packed_w_ref(
+      packed_w_ref, cutlass::make_Coord(k, n / 2));
+  onnxruntime::cuda::test::prepack_weights_ref(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
+
+  int meta_tensor_stride = scales.stride(0);
+  thrust::device_vector<cutlass::half_t> packed_scale_dev;
+
+  if constexpr (std::is_same<LayoutQMeta, cutlass::layout::ColumnMajor>::value) {
+    std::vector<cutlass::half_t> packed_scales_ref(scales.size());
+    mickey::MatrixRef<cutlass::half_t, LayoutQMeta, true> tensor_packed_s_ref =
+        mickey::make_MatrixRef<cutlass::half_t, LayoutQMeta, true>(packed_scales_ref, scales.extent());
+    onnxruntime::cuda::test::prepack_quant_scales_ref<cutlass::half_t, LayoutQMeta, QuantBlocking>(
+        k, n, onnxruntime::test::make_ConstMatrixRef(scales), tensor_packed_s_ref);
+    packed_scale_dev = packed_scales_ref;
+  
+    // std::vector<uint8_t> packed_zp_ref(meta_shape.product());
+    // mickey::MatrixRef<uint8_t, LayoutQMeta, true> tensor_packed_zp_ref =
+    //     mickey::make_MatrixRef<ElementQOffset, LayoutQMeta, true>(packed_zp_ref, meta_shape);
+    // onnxruntime::cuda::test::prepack_quant_offsets_ref<LayoutQMeta, QuantBlocking>(
+    //       rows, columns, tensor_offset.const_ref(), tensor_packed_zp_ref);
+  } else {
+    packed_scale_dev.resize(scales.size());
+    thrust::copy(scales.host_data(), scales.host_data() + scales.size(), packed_scale_dev.begin());
+  }
+
+  thrust::device_vector<uint8_t> packed_w_dev(packed_w_ref);
+  thrust::device_vector<uint8_t> packed_w_result(packed_w_ref.size());
+  thrust::fill(packed_w_result.begin(), packed_w_result.end(), 0);
+
+  cutlass::Status status = test.run(nullptr, problem_size,
+                                    thrust::raw_pointer_cast(packed_w_result.data()), problem_size.k(),
+                                    thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
+                                    thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
   ASSERT_EQ(status, cutlass::Status::kSuccess);
   cudaDeviceSynchronize();
 
-  q4_weights_copy.sync_host();
-
-  bool pass = cutlass::reference::host::TensorEquals(tensor_weight_prepacked.host_view(), q4_weights_copy.host_view());
-  // if (!pass) {
-  //   std::cerr << "Mismatched!\n";
-  //   std::cerr << "------------ tensor_weight_prepacked -----------------------\n" << std::endl;
-  //   for (int c = 0; c < tensor_weight_prepacked.extent().column(); ++c) {
-  //     for (int r = 0; r < tensor_weight_prepacked.extent().row(); ++r) {
-  //       printf("%3d ", int(tensor_weight_prepacked.at({r, c})));
-  //     }
-  //     printf("\n");
-  //   }
-    
-  //   std::cerr << "------------ q4_weights_copy -----------------------\n" << q4_weights_copy.host_view() << std::endl;
-  // }
-  ASSERT_TRUE(pass);
-
+  for (int i = 0; i < packed_w_ref.size(); ++i) {
+    ASSERT_EQ(packed_w_ref[i], packed_w_result[i]);
+  }
 }
 
 TEST(TensorCoreLoader, PackedBTest) {
-  test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 40, 1024 + 16);
-  test_load_packed_b<cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 80, 1024 + 16);
-  test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 4>(1, 80, 2048 + 16);
+  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
+  // test_load_packed_b<cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 80, 1024 + 16);
+  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 4>(1, 80, 2048 + 16);
+  // test_load_packed_b<cutlass::gemm::GemmShape<1, 32, 128>, 2, 4>(1, 176, 4096 + 16);
+  test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 1, 3>(1, 16, 64);
 }
 
 } // namespace test
