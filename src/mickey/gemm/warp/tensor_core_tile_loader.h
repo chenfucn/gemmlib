@@ -21,12 +21,9 @@ namespace warp {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-///  Warp level Tensor Core tile loader, load tiles from global memory to shared memory
-///  using ld.async, so that the shared memory tiles can be loaded to registers using
-///  ldmatrix instruction while minimizing bank conflicts, without using memory swizzling
-///
-///  For Gemm C = A * B, for matrix A, input must be row major, for matrix B, input must be
-///  column major.
+///  Tensor Core tile loader, load tiles from global memory to shared memory using ld.async,
+///  so that the shared memory tiles can be loaded to registers using ldmatrix instruction while
+///  minimizing bank conflicts, without using memory swizzling
 ///
 template <
     /// Number of tiles in the M or N dimension
@@ -35,6 +32,8 @@ template <
     int KTiles>
 class TensorCoreTileLoader {
   public:
+    // Number of tiles must be loaded from global memory to shared memory with a single ld.async
+    // instruction by each thread in the warp, and a single ldmatrix instruction by the warp.
     static constexpr int kMNTiles = MNTiles;
     static constexpr int kKTiles = KTiles;
     static constexpr int kTiles = kMNTiles * kKTiles;
@@ -184,7 +183,7 @@ class TensorCoreTileLoader {
 
   /// Load from next position in the M or N dimension
   CUTLASS_DEVICE
-  void load_with_mn_offset(void* smem_ptr, int mn_offset) {
+  void load_with_mn_offset(void* smem_ptr, int mn_offset) const {
     if constexpr (kThreads < 32) {
       if (lane_id_ >= kThreads) {
         return;
@@ -206,6 +205,19 @@ class TensorCoreTileLoader {
       g_ptr_ = nullptr;
     }
     return *this;
+  }
+
+  template<int MNLoads>
+  CUTLASS_DEVICE
+  void load_lateral_n(void* smem_ptr) const {
+    uint8_t* smem_ptr_b = reinterpret_cast<uint8_t*>(smem_ptr);
+    this->load_to(smem_ptr_b);
+    smem_ptr_b += kByteSize;
+    CUTLASS_PRAGMA_UNROLL
+    for (int n_load = 1; n_load < MNLoads; ++n_load) {
+      this->load_with_mn_offset(smem_ptr_b, n_load * kMNStride);
+      smem_ptr_b += kByteSize;
+    }
   }
 
   CUTLASS_DEVICE

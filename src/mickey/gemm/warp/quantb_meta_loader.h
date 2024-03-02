@@ -73,7 +73,6 @@ struct QuantBScaleLoader {
 
   static constexpr int kBTiles = (WarpShape::kK / 8) * (WarpShape::kN / 8);
   using FragmentPackedB = cutlass::Array<unsigned, kBTiles / 4>;
-  using FragmentB = cutlass::Array<ElementT, kBTiles * 2>;
 
   //
   // Data members
@@ -109,6 +108,7 @@ struct QuantBScaleLoader {
     dst_ptr[3] = (src >> 12) & 0x000f000f;
   }
 
+  /// Initializes the scale loader, pointing to the start of the scales tensor
   CUTLASS_DEVICE
   QuantBScaleLoader(
       int lane_idx,
@@ -130,6 +130,8 @@ struct QuantBScaleLoader {
     }
   }
 
+  /// Loads [start_k, end_k) x [start_n, end_n) scales from global memory to fragment
+  /// [start_n, end_n) was specified in the constructor
   CUTLASS_DEVICE
   void load(FragmentScales &frag_scales, int start_k, int end_k) const {
     if (end_k <= start_k) {
@@ -201,99 +203,110 @@ struct QuantBScaleLoader {
     }
   }
 
+  using FragmentB = cutlass::Array<ElementT, 2 * (WarpShape::kN / 8) * 2>;
+
+  /// Dequantize a block of (16, WarpShape::kN) packed int4 weights to 16b float.
+  /// This block has (WarpShape::kN / 8) * 2 tiles, each tile has 2 elements per thread,
+  /// thus the FragmentB has (WarpShape::kN / 8) * 2 * 2 elements.
   CUTLASS_DEVICE
-  void dequant(FragmentPackedB const &frag_pack_b, FragmentScales const &frag_scales, FragmentB &frag_b) const {
-    int b_idx = 0;
+  void dequant_k16(const int k_offset, FragmentPackedB const &frag_pack_b, FragmentScales const &frag_scales, FragmentB &frag_b) const {
+  #ifndef NDEBUG
+    if ((k_offset % 16) != 0) {
+      if (lane_b_k_offset == 0 && lane_b_n_offset == 0) {
+        printf("k_offset must be multiple of 16\n");
+      }
+      assert(false);
+    }
+  #endif
+
+    int b_idx = (k_offset >> 4) * (WarpShape::kN / 16);
+    ElementT* fb_ptr = frag_b.data();
     if (QuantBlocking::kColumn == 1) {
       // Column-wise quantization, every column has its own scale/offset
-      for (int kk = 0; kk < WarpShape::kK; kk += 16) {
-        static_assert(QuantBlocking::kColumn > 1 || QuantBlocking::kRow >= 16);
-        int meta_k = kk / QuantBlocking::kRow;
-        for (int nn = 0; nn < WarpShape::kN / 8; nn += 2, b_idx += 8) {
-          ElementT scale = frag_scales[meta_k * kMetaFragSize + nn];
-          ElementT scale2 = frag_scales[meta_k * kMetaFragSize + nn + 1];
+      static_assert(QuantBlocking::kColumn > 1 || QuantBlocking::kRow >= 16);
+      int meta_k = k_offset / QuantBlocking::kRow;
+      for (int nn = 0; nn < WarpShape::kN / 8; nn += 2, ++b_idx, fb_ptr += 8) {
+        ElementT scale = frag_scales[meta_k * kMetaFragSize + nn];
+        ElementT scale2 = frag_scales[meta_k * kMetaFragSize + nn + 1];
 
-          cutlass::Array<int16_t, 8> ws;
-          expand_int4_to_int16(frag_pack_b[b_idx/8], ws);
-          frag_b[b_idx] = ElementT(ws[0] - 8) * scale;
-          frag_b[b_idx + 1] = ElementT(ws[1] - 8) * scale;
-          frag_b[b_idx + 2] = ElementT(ws[2] - 8) * scale;
-          frag_b[b_idx + 3] = ElementT(ws[3] - 8) * scale;
-          frag_b[b_idx + 4] = ElementT(ws[4] - 8) * scale2;
-          frag_b[b_idx + 5] = ElementT(ws[5] - 8) * scale2;
-          frag_b[b_idx + 6] = ElementT(ws[6] - 8) * scale2;
-          frag_b[b_idx + 7] = ElementT(ws[7] - 8) * scale2;
+        cutlass::Array<int16_t, 8> ws;
+        expand_int4_to_int16(frag_pack_b[b_idx], ws);
+        fb_ptr[0] = ElementT(ws[0] - 8) * scale;
+        fb_ptr[1] = ElementT(ws[1] - 8) * scale;
+        fb_ptr[2] = ElementT(ws[2] - 8) * scale;
+        fb_ptr[3] = ElementT(ws[3] - 8) * scale;
+        fb_ptr[4] = ElementT(ws[4] - 8) * scale2;
+        fb_ptr[5] = ElementT(ws[5] - 8) * scale2;
+        fb_ptr[6] = ElementT(ws[6] - 8) * scale2;
+        fb_ptr[7] = ElementT(ws[7] - 8) * scale2;
 
-          if constexpr (DebugPrint) {
-            const int lane_id = threadIdx.x % 32;
-            const char* const format = ((lane_id % 4) == 3) ? "%f=%2dx%f, %f=%2dx%f\n" : "%f=%2dx%f, %f=%2dx%f, ";
-            printf(format, float(frag_b[b_idx]), int(ws[0]), float(scale),
-                  float(frag_b[b_idx + 1]), int(ws[1]), float(scale));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 2]), int(ws[2]), float(scale),
-                  float(frag_b[b_idx + 3]), int(ws[3]), float(scale));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 4]), int(ws[4]), float(scale2),
-                  float(frag_b[b_idx + 5]), int(ws[5]), float(scale2));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 6]), int(ws[6]), float(scale2),
-                  float(frag_b[b_idx + 7]), int(ws[7]), float(scale2));
-            if (lane_id == 31) {
-              printf("\n");
-            }
+        if constexpr (DebugPrint) {
+          const int lane_id = threadIdx.x % 32;
+          const char* const format = ((lane_id % 4) == 3) ? "%f=%2dx%f, %f=%2dx%f\n" : "%f=%2dx%f, %f=%2dx%f, ";
+          printf(format, float(fb_ptr[0]), int(ws[0]), float(scale),
+                float(fb_ptr[1]), int(ws[1]), float(scale));
+          if (lane_id == 31) {
+            printf("\n");
+          }
+          printf(format, float(fb_ptr[2]), int(ws[2]), float(scale),
+                float(fb_ptr[3]), int(ws[3]), float(scale));
+          if (lane_id == 31) {
+            printf("\n");
+          }
+          printf(format, float(fb_ptr[4]), int(ws[4]), float(scale2),
+                float(fb_ptr[5]), int(ws[5]), float(scale2));
+          if (lane_id == 31) {
+            printf("\n");
+          }
+          printf(format, float(fb_ptr[6]), int(ws[6]), float(scale2),
+                float(fb_ptr[7]), int(ws[7]), float(scale2));
+          if (lane_id == 31) {
+            printf("\n");
           }
         }
       }
     } else {
       // Row-wise quantization, every row has its own scale/offset
-      for (int kk = 0; kk < WarpShape::kK/16; ++kk) {
-        ElementT const* scales = nullptr;
-        for (int nn = 0; nn < WarpShape::kN; nn += 16, b_idx += 8) {
-          if (nn % QuantBlocking::kColumn == 0) {
-            int meta_n = nn / QuantBlocking::kColumn;
-            scales = frag_scales.data() + (meta_n * kMetaFragSize + kk * 4);
+      ElementT const* scales = nullptr;
+      for (int nn = 0; nn < WarpShape::kN; nn += 16, ++b_idx, fb_ptr += 8) {
+        if (nn % QuantBlocking::kColumn == 0) {
+          int meta_n = nn / QuantBlocking::kColumn;
+          scales = frag_scales.data() + (meta_n * kMetaFragSize + k_offset / 4); // k_offset / 16 * 4
+        }
+
+        cutlass::Array<int16_t, 8> ws;
+        expand_int4_to_int16(frag_pack_b[b_idx], ws);
+        fb_ptr[0] = ElementT(ws[0] - 8) * scales[0];
+        fb_ptr[1] = ElementT(ws[1] - 8) * scales[1];
+        fb_ptr[2] = ElementT(ws[2] - 8) * scales[2];
+        fb_ptr[3] = ElementT(ws[3] - 8) * scales[3];
+        fb_ptr[4] = ElementT(ws[4] - 8) * scales[0];
+        fb_ptr[5] = ElementT(ws[5] - 8) * scales[1];
+        fb_ptr[6] = ElementT(ws[6] - 8) * scales[2];
+        fb_ptr[7] = ElementT(ws[7] - 8) * scales[3];
+
+        if constexpr (DebugPrint) {
+          const int lane_id = threadIdx.x % 32;
+          const char* const format = ((lane_id % 4) == 3) ? "%f=%2dx%f, %f=%2dx%f\n" : "%f=%2dx%f, %f=%2dx%f, ";
+          printf(format, float(fb_ptr[0]), int16_t(ws[0]), float(scales[0]),
+                float(fb_ptr[1]), int16_t(ws[1]), float(scales[1]));
+          if (lane_id == 31) {
+            printf("\n");
           }
-
-          cutlass::Array<int16_t, 8> ws;
-          expand_int4_to_int16(frag_pack_b[b_idx/8], ws);
-          frag_b[b_idx] = ElementT(ws[0] - 8) * scales[0];
-          frag_b[b_idx + 1] = ElementT(ws[1] - 8) * scales[1];
-          frag_b[b_idx + 2] = ElementT(ws[2] - 8) * scales[2];
-          frag_b[b_idx + 3] = ElementT(ws[3] - 8) * scales[3];
-          frag_b[b_idx + 4] = ElementT(ws[4] - 8) * scales[0];
-          frag_b[b_idx + 5] = ElementT(ws[5] - 8) * scales[1];
-          frag_b[b_idx + 6] = ElementT(ws[6] - 8) * scales[2];
-          frag_b[b_idx + 7] = ElementT(ws[7] - 8) * scales[3];
-
-          if constexpr (DebugPrint) {
-            const int lane_id = threadIdx.x % 32;
-            const char* const format = ((lane_id % 4) == 3) ? "%f=%2dx%f, %f=%2dx%f\n" : "%f=%2dx%f, %f=%2dx%f, ";
-            printf(format, float(frag_b[b_idx]), int16_t(ws[0]), float(scales[0]),
-                  float(frag_b[b_idx + 1]), int16_t(ws[1]), float(scales[1]));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 2]), int16_t(ws[2]), float(scales[2]),
-                  float(frag_b[b_idx + 3]), int16_t(ws[3]), float(scales[3]));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 4]), int16_t(ws[4]), float(scales[0]),
-                  float(frag_b[b_idx + 5]), int16_t(ws[5]), float(scales[1]));
-            if (lane_id == 31) {
-              printf("\n");
-            }
-            printf(format, float(frag_b[b_idx + 6]), int16_t(ws[6]), float(scales[2]),
-                  float(frag_b[b_idx + 7]), int16_t(ws[7]), float(scales[3]));
-            if (lane_id == 31) {
-              printf("\n");
-            }
+          printf(format, float(fb_ptr[2]), int16_t(ws[2]), float(scales[2]),
+                float(fb_ptr[3]), int16_t(ws[3]), float(scales[3]));
+          if (lane_id == 31) {
+            printf("\n");
+          }
+          printf(format, float(fb_ptr[4]), int16_t(ws[4]), float(scales[0]),
+                float(fb_ptr[5]), int16_t(ws[5]), float(scales[1]));
+          if (lane_id == 31) {
+            printf("\n");
+          }
+          printf(format, float(fb_ptr[6]), int16_t(ws[6]), float(scales[2]),
+                float(fb_ptr[7]), int16_t(ws[7]), float(scales[3]));
+          if (lane_id == 31) {
+            printf("\n");
           }
         }
       }

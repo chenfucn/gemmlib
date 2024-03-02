@@ -49,6 +49,10 @@ template <
 >
 struct LoadPackedBTestKernel {
  public:
+  //
+  // Type definitions
+  //
+
   using QuantBlocking = QuantBlocking_;
   using WarpShape = WarpShape_;
   static constexpr bool has_quant_offset = has_quant_offset_;
@@ -79,10 +83,26 @@ struct LoadPackedBTestKernel {
   static_assert((WarpPackedBShape::kN % PackedBLoader::kMNStride) == 0);
   static_assert((WarpPackedBShape::kK % PackedBLoader::kKStride) == 0);
 
-  static constexpr int kNloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
-  static constexpr int kKloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
+  static constexpr int kB_Nloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
+  static constexpr int kB_Kloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
 
-  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, true>;
+  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
+
+  // Since int4 weights are packed (16x16) -> (8x8), each tile is expanded to 4 tiles when
+  // de-quantized to 16b float.
+
+  // Fragments (hopefully allocated to registers)
+  using FragmentPackedB = cutlass::Array<
+      unsigned,  // 8 of int4 weights each tile (becomes 4 tiles when de-quantized)
+      PackedBLoader::kTiles * kB_Nloads * kB_Kloads>;  // keep all in registers to reuse scales/offsets
+
+  // Fragments for operand B, each tile has 2 elements per thread. In each iteration, we use a
+  // (16, WarpShape::kN) block for mma, i.e. (WarpShape::kN / 8) * 2 tiles
+  using FragmentB = cutlass::Array<ElementT, 2 * (WarpShape::kN / 8) * 2>;
+
+  // Fragments for operand A, each tile has 2 elements per thread. In each iteration, we use a
+  // (WarpShape::kM, 16) block for mma, i.e. (WarpShape::kM / 8) * 2 tiles
+  using FragmentA = cutlass::Array<ElementT, 2 * (WarpShape::kM / 8) * 2>;
 
   static constexpr int kWarps = kSplitK; // TODO! more warps when we have a larger thread block shape
   static int const kThreadCount = 32 * kWarps;
@@ -104,10 +124,6 @@ struct LoadPackedBTestKernel {
     void const * const ptr_offsets_;
     const int offsets_byte_stride_;
     int gemm_k_size_{0};
-
-    //
-    // Methods
-    //
 
     CUTLASS_HOST_DEVICE
     Params() { }
@@ -143,10 +159,9 @@ struct LoadPackedBTestKernel {
   /// Shared memory storage structure
   struct SharedStorage {
     /// Buffer for prepacked weights
-    static constexpr int kPackedBSizePerIter = kNloads * kKloads * PackedBLoader::kByteSize;
+    static constexpr int kPackedBSizePerIter = kB_Nloads * kB_Kloads * PackedBLoader::kByteSize;
     static constexpr int kPackedBSizePerWarp = kPackedBSizePerIter * kStages;
     static constexpr int kPackedBSize = kPackedBSizePerWarp * kWarps;
-
     cutlass::AlignedBuffer<uint8_t, kPackedBSize> operand_B;
   };
 
@@ -159,6 +174,11 @@ struct LoadPackedBTestKernel {
 
   /// Determines whether kernel satisfies alignment
   static cutlass::Status can_implement(const Params &params) {
+    if ((params.problem_size_.k() % QuantBlocking::kRow != 0) ||
+        (params.problem_size_.n() % QuantBlocking::kColumn) != 0){
+      std::cerr << "LoadPackedBTestKernel validation fail: partial quantization block not supported!" << std::endl;
+      return cutlass::Status::kErrorInvalidProblem;
+    }
     if (reinterpret_cast<uintptr_t>(params.ptr_packed_b_) % 16) {
       std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_packed_b_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
@@ -267,9 +287,9 @@ struct LoadPackedBTestKernel {
     assert(assert_pass);
 #endif
 
-    // Fragments (hopefully in registers) for A and B
-    using FragmentPackedB = cutlass::Array<unsigned, PackedBLoader::kTiles * kNloads * kKloads>;
     FragmentPackedB fragment_packed_b;
+    typename MetaLoader::FragmentScales fragment_scales[kStages];
+    FragmentB fragment_b;
 
     //
     // for gemm input B size (k,n), packed b is (k/2,n/2), element size 2, column major.
@@ -299,9 +319,6 @@ struct LoadPackedBTestKernel {
       params.scales_byte_stride_,
       n_start, n_end};
 
-    typename MetaLoader::FragmentScales fragment_scales[kStages];
-    typename MetaLoader::FragmentB fragment_b;
-
     if constexpr (kDebugPrint) {
       if (lane_idx == 0) {
         printf("Warp: %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
@@ -327,14 +344,9 @@ struct LoadPackedBTestKernel {
 
       // Load packed b
       CUTLASS_PRAGMA_UNROLL
-      for (int k_load = 0; k_load < kKloads; ++k_load) {
-        packed_b_loader.load_to(packed_b_smem_ptr);
-        packed_b_smem_ptr += PackedBLoader::kByteSize;
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_load = 1; n_load < kNloads; ++n_load) {
-          packed_b_loader.load_with_mn_offset(packed_b_smem_ptr, n_load * PackedBLoader::kMNStride);
-          packed_b_smem_ptr += PackedBLoader::kByteSize;
-        }
+      for (int k_load = 0; k_load < kB_Kloads; ++k_load) {
+        packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_ptr);
+        packed_b_smem_ptr += PackedBLoader::kByteSize * kB_Nloads;
         ++packed_b_loader;
       }
 
@@ -347,8 +359,8 @@ struct LoadPackedBTestKernel {
     //__syncthreads(); is this necessary since the loader is warp based?
     if constexpr(kDebugPrint) {
       if (lane_idx == 0) {
-        printf("Prologue, warp: %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\nShapredPtr: %p, WarpPtr: %p\n",
-          warp_idx, k_start, k_end, packed_n_start, packed_n_end, shared_storage.operand_B.data(), packed_b_shared_ptr);
+        printf("Prologue, warp: %d, ShapredPtr: %p, WarpPtr: %p\n",
+          warp_idx, shared_storage.operand_B.data(), packed_b_shared_ptr);
       }
       cutlass::debug::dump_shmem(shared_storage.operand_B.data(), SharedStorage::kPackedBSize);
     }
@@ -368,52 +380,51 @@ struct LoadPackedBTestKernel {
       // over-complicated tile visiting pattern. We always want to visit the all the
       // packed B tiles on the N dimension in a contiguous manner, and then move to the next
       // K dimension.
-      static_assert(PackedBLoader::kKStride <= 16 || kNloads == 1);
+      static_assert(PackedBLoader::kKStride <= 16 || kB_Nloads == 1);
 
+      // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
-      for (int k_load = 0; k_load < kKloads; ++k_load) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_load = 0; n_load < kNloads; ++n_load, ++packed_b_tile_frag_ptr) {
-          PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, lane_idx, packed_b_smem_read_ptr);
-          packed_b_smem_read_ptr += PackedBLoader::kByteSize;
-
-          if constexpr (kDebugPrint) {
-            uint8_t const* ptr = reinterpret_cast<uint8_t const*>(packed_b_tile_frag_ptr->data());
-            printf("Warp: %d, lane %2d, smem_read_ptr %p, %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d\n",
-              warp_idx, lane_idx, packed_b_smem_read_ptr, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
-          }
-        }
-
-        if (load_k < k_end) {
-          packed_b_loader.load_to(packed_b_smem_write_ptr);
-          packed_b_smem_write_ptr += PackedBLoader::kByteSize;
+      for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
+        // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
+        if ((warp_k_offset % PackedBLoader::kKStride) == 0) {
           CUTLASS_PRAGMA_UNROLL
-          for (int n_load = 1; n_load < kNloads; ++n_load) {
-            packed_b_loader.load_with_mn_offset(packed_b_smem_write_ptr, n_load * PackedBLoader::kMNStride);
-            packed_b_smem_write_ptr += PackedBLoader::kByteSize;
-          }
-          ++packed_b_loader;
-        }
-        load_k += PackedBLoader::kKStride;
-      }
+          for (int n_load = 0; n_load < kB_Nloads; ++n_load, ++packed_b_tile_frag_ptr) {
+            PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, lane_idx, packed_b_smem_read_ptr);
+            packed_b_smem_read_ptr += PackedBLoader::kByteSize;
 
-      int tt = 0;
-      CUTLASS_PRAGMA_UNROLL
-      for (int pack_b_tile_k = 0; pack_b_tile_k < (WarpPackedBShape::kK/16); ++pack_b_tile_k) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int pack_b_tile_n = 0; pack_b_tile_n < (WarpPackedBShape::kN/8); ++pack_b_tile_n, ++tt) {
-          int n = packed_n_start + pack_b_tile_n * 8 + lane_b_n_offset;
-          int k = proc_k + pack_b_tile_k * 16 + lane_b_k_offset * sizeof(unsigned);
-          if (n < packed_n_end && k < k_end) {
-            unsigned* dst = reinterpret_cast<unsigned*>(reinterpret_cast<uint8_t*>(params.ptr_output_) + n * params.output_byte_stride_ + k);
-            *dst = fragment_packed_b[tt];
+            if constexpr (kDebugPrint) {
+              uint8_t const* ptr = reinterpret_cast<uint8_t const*>(packed_b_tile_frag_ptr->data());
+              printf("Warp: %d, lane %2d, smem_read_ptr %p, %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d\n",
+                warp_idx, lane_idx, packed_b_smem_read_ptr, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
+            }
           }
+
+          if (load_k < k_end) {
+            packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
+            packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
+            ++packed_b_loader;
+          }
+          load_k += PackedBLoader::kKStride;
         }
-      }
-      meta_loader.dequant(fragment_packed_b, fragment_scales[smem_read_stage], fragment_b);
-      if constexpr (kDebugPrint) {
-        for (int tile = 0; tile < (WarpShape::kK/8) * (WarpShape::kN/8); tile ++){
-          printf("Warp: %d, lane %d, B: %f, %f\n", warp_idx, lane_idx, float(fragment_b[tile * 2]), float(fragment_b[tile * 2 + 1]));
+
+        // Dequantize weights block (16, WarpShape::kN)
+        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales[smem_read_stage], fragment_b);
+        CUTLASS_PRAGMA_UNROLL
+        for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
+          int n = n_start + b_tile_n * 8 + lane_b_n_offset;
+          int k = proc_k + warp_k_offset + lane_b_k_offset * 2;
+          if (n < n_end && k < k_end) {
+            int stride = params.output_byte_stride_ / kElementSize;
+            ElementT* dst = reinterpret_cast<ElementT*>(params.ptr_output_) + k * stride + n;
+            const int frag_b_idx = b_tile_n * 4;
+            *dst = fragment_b[frag_b_idx];
+            dst += stride;
+            *dst = fragment_b[frag_b_idx + 1];
+            dst += stride * 7;
+            *dst = fragment_b[frag_b_idx + 2];
+            dst += stride;
+            *dst = fragment_b[frag_b_idx + 3];
+          }
         }
       }
 
@@ -495,13 +506,13 @@ class LoadPackedBTest {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename WarpShape, int kSplitK, int kStages>
+template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
 void test_load_packed_b(int m, int n, int k) {
-  std::cout << "Testing WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
+  std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
+            << " WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
             << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
   std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
 
-  using QuantBlocking = cutlass::MatrixShape<16, 1>;
   using Test = LoadPackedBTest<QuantBlocking, WarpShape, kSplitK, kStages>;
   Test test;
   cutlass::gemm::GemmCoord problem_size(m, n, k);
@@ -519,9 +530,13 @@ void test_load_packed_b(int m, int n, int k) {
   QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
   QuantBaseT::Dequantize4BitToFp16(tensor_b, q4_weights, scales, offsets);
   QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
+  cutlass::reference::host::TensorFill(tensor_b.host_view(), cutlass::half_t(0));
+
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> dst;
   QuantBaseT::Dequantize4BitToFp16(dst, q4_weights, scales, offsets);
 
+#if 0
+  // Debug print the weights tensor detail
   for (int col = 0; col < n; ++col) {
     for (int row = 0; row < k; ++row) {
       auto weight_pos = cutlass::make_Coord(row/2, col);
@@ -536,6 +551,7 @@ void test_load_packed_b(int m, int n, int k) {
     }
     printf("\n");
   }
+#endif
 
   std::vector<uint8_t> packed_w_ref(k * n / 2);
   mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_packed_w_ref(
@@ -564,27 +580,43 @@ void test_load_packed_b(int m, int n, int k) {
   }
 
   thrust::device_vector<uint8_t> packed_w_dev(packed_w_ref);
-  thrust::device_vector<uint8_t> packed_w_result(packed_w_ref.size());
-  thrust::fill(packed_w_result.begin(), packed_w_result.end(), 0);
+  tensor_b.sync_device();
 
+  int dequant_stride = tensor_b.stride(0);
+  ASSERT_EQ(dequant_stride, problem_size.n());
   cutlass::Status status = test.run(nullptr, problem_size,
-                                    thrust::raw_pointer_cast(packed_w_result.data()), problem_size.k(),
+                                    tensor_b.device_data(), dequant_stride * sizeof(cutlass::half_t),
                                     thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
                                     thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
   ASSERT_EQ(status, cutlass::Status::kSuccess);
+  tensor_b.sync_host();
   cudaDeviceSynchronize();
-
-  for (int i = 0; i < packed_w_ref.size(); ++i) {
-    ASSERT_EQ(packed_w_ref[i], packed_w_result[i]);
+  bool passed = cutlass::reference::host::TensorEquals(dst.host_view(), tensor_b.host_view());
+  if (!passed) {
+    std::cerr << "Mismatch found in test_load_packed_b!" << std::endl;
+    std::cerr << "Expected:" << std::endl;
+    std::cerr << dst.host_view() << std::endl;
+    std::cerr << "Actual:" << std::endl;
+    std::cerr << tensor_b.host_view() << std::endl;
   }
+  ASSERT_TRUE(passed);
 }
 
 TEST(TensorCoreLoader, PackedBTest) {
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 80, 1024 + 16);
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 2, 4>(1, 80, 2048 + 16);
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 32, 128>, 2, 4>(1, 176, 4096 + 16);
-  test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 1, 3>(1, 16, 64);
+  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
+  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+
+  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
+  test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
+  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
+
+  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 64, 128>, 1, 4>(1, 160, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 128, 128>, 1, 4>(1, 176, 4096 + 32);
+
+  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 1, 3>(1, 16, 64);
 }
 
 } // namespace test
