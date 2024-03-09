@@ -198,8 +198,12 @@ class TensorCoreTileLoader {
   /// Advances to the next position in the K dimension
   CUTLASS_DEVICE
   TensorCoreTileLoader& operator++() {
+    if (g_ptr_ == nullptr) {
+      return *this;
+    }
+  
     k16_cnt_ -= kKTiles;
-    if (g_ptr_ != nullptr && k16_cnt_ > 0) {
+    if (k16_cnt_ > 0) {
       g_ptr_ += 16 * kKTiles;
     } else {
       g_ptr_ = nullptr;

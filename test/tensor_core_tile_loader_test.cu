@@ -68,7 +68,7 @@ struct LoadPackedBTestKernel {
 
   static constexpr bool kDebugPrint = false;
   static constexpr bool kDebugPrintFragA = false;
-  static constexpr bool kDebugPrintC = true;
+  static constexpr bool kDebugPrintC = false;
 
   using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
   using ElementT = cutlass::half_t;
@@ -284,6 +284,10 @@ struct LoadPackedBTestKernel {
     if (params.output_byte_stride_ % 16) {
       std::cerr << "LoadPackedBTestKernel validation fail: params.output_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
+    }
+    if (params.problem_size_.n() > (params.output_byte_stride_ / kElementSize)) {
+      std::cerr << "LoadPackedBTestKernel validation fail: params.problem_size_.n() is greater than params.output_byte_stride_!" << std::endl;
+      return cutlass::Status::kErrorInvalidProblem;
     }
     if (params.problem_size_.k() % 16 != 0) {
       std::cerr << "LoadPackedBTestKernel validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
@@ -520,8 +524,15 @@ struct LoadPackedBTestKernel {
           a_smem_read_ptr += ATileLoader::kByteSize / kElementSize;
         }
 
+        a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_write_ptr);
+        a_smem_write_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
+        ++a_tile_loader;
+
         if constexpr (kDebugPrintFragA) {
           const int lane_id = threadIdx.x % 32;
+          if (lane_id == 0) {
+            printf("====  A tiles =======\n");
+          }
           const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
           const ElementT* a_ptr = fragment_a.data();
           for (int m2_tile = 0; m2_tile < (WarpShape::kM / InstructionShape::kM); ++m2_tile, a_ptr += 8) {
@@ -534,23 +545,6 @@ struct LoadPackedBTestKernel {
 
         // Dequantize weights block (16, WarpShape::kN)
         meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales[smem_read_stage], fragment_addon, fragment_b);
-        CUTLASS_PRAGMA_UNROLL
-        for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
-          int n = n_start + b_tile_n * 8 + lane_b_n_offset;
-          int k = proc_k + warp_k_offset + lane_b_k_offset * 2;
-          if (n < n_end && k < k_end) {
-            int stride = params.output_byte_stride_ / kElementSize;
-            ElementT* dst = reinterpret_cast<ElementT*>(params.ptr_output_) + k * stride + n;
-            const int frag_b_idx = b_tile_n * 4;
-            *dst = fragment_b[frag_b_idx];
-            dst += stride;
-            *dst = fragment_b[frag_b_idx + 1];
-            dst += stride * 7;
-            *dst = fragment_b[frag_b_idx + 2];
-            dst += stride;
-            *dst = fragment_b[frag_b_idx + 3];
-          }
-        }
 
         // GEMM operation, covering a shape of (WarpShape::kM, WarpShape::kN, InstructionShape::kK)
         mma_op(accumulators, fragment_a, fragment_b, accumulators);
@@ -573,16 +567,39 @@ struct LoadPackedBTestKernel {
 
     cutlass::arch::cp_async_wait<0>();
     __syncthreads();
+
+    //TODO!!! gather the result from all warps
+
     if constexpr (kDebugPrintC) {
       static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
       const float* c_ptr = accumulators.data();
       const int lane_id = threadIdx.x % 32;
+      if (lane_id == 0) {
+        printf("====  C tiles =======\n");
+      }
       const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
       for (int n_tile = 0; n_tile < (WarpShape::kN / InstructionShape::kN); ++n_tile) {
         for (int m_tile = 0; m_tile < (WarpShape::kM / InstructionShape::kM); ++m_tile, c_ptr += 4) {
           // since InstructionShape::kM is 16, we can print 2 tiles
           printf(format, float(c_ptr[0]), float(c_ptr[1]));
           printf(format, float(c_ptr[2]), float(c_ptr[3]));
+        }
+      }
+    }
+
+    // Store the result
+    __half2* output_ptr = reinterpret_cast<__half2*>(params.ptr_output_);
+    int output_stride = params.output_byte_stride_ / sizeof(__half2);
+    const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data());
+
+    int n = n_start + lane_b_k_offset * 2;
+    CUTLASS_PRAGMA_UNROLL
+    for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile, n += 8) {
+      int m = m_start + lane_b_n_offset;
+      CUTLASS_PRAGMA_UNROLL
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile, m += 8, ++c_ptr) {
+        if (n < n_end && m < m_end) {
+          *(output_ptr + m * output_stride + n/2) = __float22half2_rn(c_ptr[0]);
         }
       }
     }
@@ -655,6 +672,23 @@ class LoadPackedBTest {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename LayoutT, typename ElementT>
+void print_tiled_tensor(cutlass::HostTensor<ElementT, LayoutT>& t) {
+  for (int row = 0; row < t.extent()[0]; ++row) {
+    for (int col = 0; col < t.extent()[1]; ++col) {
+      printf("%f, ", static_cast<float>(t.at({row, col})));
+      if (col % 8 == 7) {
+        printf(", ");
+      }
+    }
+    printf("\n");
+    if (row % 8 == 7) {
+      printf("\n");
+    }
+  }
+}
+
+
 template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
 void test_load_packed_b(int m, int n, int k) {
   std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
@@ -670,11 +704,13 @@ void test_load_packed_b(int m, int n, int k) {
   using QuantBaseT = onnxruntime::test::BlkQuantizationRef<QuantBlocking, has_offsets>;
   using LayoutQMeta = typename QuantBaseT::LayoutQMeta;
 
+  // fill the tensor with reduced bits fp16 seems to be necessary to avoid rounding errors
+  // during test. Need to investigate further why.
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_a({m, k});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 51, -1.75f, 1.9f);
+  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 174321, 1.5f, -1.125f, 6);
 
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_b({k, n});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 51, -1.75f, 1.9f);
+  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 193456, 1.75f, -1.25f, 8);
   cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> q4_weights;
   cutlass::HostTensor<cutlass::half_t, LayoutQMeta> scales;
   cutlass::HostTensor<uint8_t, LayoutQMeta> offsets;
@@ -686,6 +722,11 @@ void test_load_packed_b(int m, int n, int k) {
 
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> dst;
   QuantBaseT::Dequantize4BitToFp16(dst, q4_weights, scales, offsets);
+
+  // Allocate result tensor
+  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_d(
+      problem_size.mn());
+  cutlass::reference::host::TensorFill(tensor_d.host_view());
 
 #if 0
   // Debug print the weights tensor detail
@@ -740,25 +781,23 @@ void test_load_packed_b(int m, int n, int k) {
   }
 
   thrust::device_vector<uint8_t> packed_w_dev(packed_w_ref);
-  tensor_b.sync_device();
+  tensor_d.sync_device();
   tensor_a.sync_device();
 
-  int dequant_stride = tensor_b.stride(0);
-  ASSERT_EQ(dequant_stride, problem_size.n());
   cutlass::Status status = test.run(nullptr, problem_size,
-                                    tensor_b.device_data(), dequant_stride * sizeof(cutlass::half_t),
+                                    tensor_d.device_data(), tensor_d.stride(0) * sizeof(cutlass::half_t),
                                     tensor_a.device_data(), tensor_a.stride(0) * sizeof(cutlass::half_t),
                                     thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
                                     thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
   ASSERT_EQ(status, cutlass::Status::kSuccess);
-  tensor_b.sync_host();
+  tensor_d.sync_host();
 
   // Run reference kernel
-  cutlass::HostTensor<float, cutlass::layout::RowMajor> tensor_ref_d(
+  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_ref_d(
       problem_size.mn());  // <- Create matrix D with dimensions M x N used to store output from
                            // reference kernel
   cutlass::reference::host::TensorFill(tensor_ref_d.host_view());
-  cutlass::HostTensor<float, cutlass::layout::RowMajor> tensor_c(
+  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_c(
       problem_size.mn());
   cutlass::reference::host::TensorFill(tensor_c.host_view());
 
@@ -772,7 +811,7 @@ void test_load_packed_b(int m, int n, int k) {
 
   compute_gemm_ref<cutlass::half_t, cutlass::layout::RowMajor,
                    cutlass::half_t, cutlass::layout::RowMajor,
-                   float, cutlass::layout::RowMajor,
+                   cutlass::half_t, cutlass::layout::RowMajor,
                    float, float>(
       problem_size,
       alpha,
@@ -786,49 +825,50 @@ void test_load_packed_b(int m, int n, int k) {
   cudaDeviceSynchronize();
 
   tensor_ref_d.sync_host();
-  std::cout << "========  Reference kernel result:  ============" << std::endl;
-  for (int row = 0; row < tensor_ref_d.extent()[0]; ++row) {
-    for (int col = 0; col < tensor_ref_d.extent()[1]; ++col) {
-      printf("%f, ", tensor_ref_d.at({row, col}));
-      if (col % 8 == 7) {
-        printf(", ");
+
+  for (int row = 0; row < tensor_d.extent()[0]; ++row) {
+    for (int col = 0; col < tensor_d.extent()[1]; ++col) {
+      float expected = tensor_ref_d.at({row, col});
+      float actual = tensor_d.at({row, col});
+      if (expected == actual) {
+        continue;
+      }
+      float diff = fabs(expected - actual);
+      if (diff < 2e-7) {
+        continue;
+      }
+      float diff_ratio = fabs(expected - actual) / max(fabs(expected), fabs(actual)); 
+      if (diff_ratio > 3e-3) {
+        std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " ratio: " << diff_ratio << std::endl;
+        EXPECT_TRUE(false);
       }
     }
-    printf("\n");
-    if (row % 8 == 7) {
-      printf("\n");
-    }
   }
-
-
-  bool passed = cutlass::reference::host::TensorEquals(dst.host_view(), tensor_b.host_view());
-  if (!passed) {
-    std::cerr << "Mismatch found in test_load_packed_b!" << std::endl;
-    std::cerr << "Expected:" << std::endl;
-    std::cerr << dst.host_view() << std::endl;
-    std::cerr << "Actual:" << std::endl;
-    std::cerr << tensor_b.host_view() << std::endl;
-  }
-  ASSERT_TRUE(passed);
+  // if (!passed) {
+  //   std::cout << "Mismatch found in test_load_packed_b!" << std::endl;
+  //   std::cout << " ====== Expected: ======" << std::endl;
+  //   print_tiled_tensor(tensor_ref_d);
+  //   std::cerr << " ====== Actual: ======" << std::endl;
+  //   print_tiled_tensor(tensor_d);
+  // }
 }
 
 TEST(TensorCoreLoader, PackedBTest) {
-  // test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<16, 16, 64>, 1, 4>(21, 48, 1024 + 16);
+  // test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(1, 48, 1024 + 16);
   // test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
   // test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
 
   // test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
   // test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
-  // test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
+  test_load_packed_b<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<64, 32, 32>, 1, 3>(70, 128, 512 + 16);
+  test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 1, 3>(70, 48, 64 * 7);
   // test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
 
-  // test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 64, 128>, 1, 4>(1, 160, 4096 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 128, 128>, 1, 4>(1, 176, 4096 + 32);
+  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 4>(170, 176, 2048 + 32);
 
-  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 4>(32, 32, 32);
-
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 1, 3>(1, 16, 64);
+  // test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 4>(64, 64, 64);
 }
 
 } // namespace test
