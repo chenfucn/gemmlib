@@ -369,12 +369,16 @@ struct LoadPackedBTestKernel {
     // Mainloop
     //
     for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages, proc_k += WarpShape::kK){
+      typename MetaLoader::FragmentScales fragment_addon;
+  
       uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr + smem_read_stage * SharedStorage::kPackedBSizePerIter;
       uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
 
       meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
       cutlass::Array<unsigned, PackedBLoader::kTiles>* packed_b_tile_frag_ptr =
           reinterpret_cast<cutlass::Array<unsigned, PackedBLoader::kTiles>*>(fragment_packed_b.data());
+
+      meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
 
       // If PackedBLoader::kKStride > 16, then kNLoads must be 1. Because we don't want a
       // over-complicated tile visiting pattern. We always want to visit the all the
@@ -408,7 +412,7 @@ struct LoadPackedBTestKernel {
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales[smem_read_stage], fragment_b);
+        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales[smem_read_stage], fragment_addon, fragment_b);
         CUTLASS_PRAGMA_UNROLL
         for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
           int n = n_start + b_tile_n * 8 + lane_b_n_offset;
@@ -537,8 +541,8 @@ void test_load_packed_b(int m, int n, int k) {
 
 #if 0
   // Debug print the weights tensor detail
-  for (int col = 0; col < n; ++col) {
-    for (int row = 0; row < k; ++row) {
+  for (int row = 0; row < k; ++row) {
+    for (int col = 0; col < n; ++col) {
       auto weight_pos = cutlass::make_Coord(row/2, col);
       auto meta_pos = cutlass::make_Coord(row / QuantBlocking::kRow, col / QuantBlocking::kColumn);
       const float scale = static_cast<float>(scales.at(meta_pos));
@@ -603,6 +607,8 @@ void test_load_packed_b(int m, int n, int k) {
 }
 
 TEST(TensorCoreLoader, PackedBTest) {
+  // test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 32, 64);
+
   test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
   test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
   test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
@@ -615,8 +621,6 @@ TEST(TensorCoreLoader, PackedBTest) {
 
   test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 64, 128>, 1, 4>(1, 160, 4096 + 16);
   test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 128, 128>, 1, 4>(1, 176, 4096 + 32);
-
-  // test_load_packed_b<cutlass::gemm::GemmShape<1, 16, 64>, 1, 3>(1, 16, 64);
 }
 
 } // namespace test
