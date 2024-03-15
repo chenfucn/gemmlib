@@ -64,9 +64,12 @@ struct LoadPackedBTestKernel {
   static constexpr int kStages = Stages_;
 
   static_assert(kSplitK > 0 && ((kSplitK - 1) & kSplitK) == 0,
-     "kSplitK must be positive and a power of 2");
+     "SplitK must be positive and a power of 2");
+  static_assert(kStages > 1,
+     "Number of pipeline stages must be greater than 1.");
 
-  static constexpr bool kDebugPrint = false;
+  /// switches for debug print
+  static constexpr bool kDebugPrintB = false;
   static constexpr bool kDebugPrintFragA = false;
   static constexpr bool kDebugPrintC = false;
 
@@ -93,6 +96,10 @@ struct LoadPackedBTestKernel {
   static constexpr int kB_Kloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
 
   using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
+
+  // Need to explore the way to relax this for very small m value.
+  static_assert(WarpShape::kM % 16 == 0,
+      "Stride M smaller than mma instruction shape is not yet supported!");
 
   // load A to shared memory, 2x2 tile to match the tensorcore shape 16x8x16
   using ATileLoader = mickey::gemm::warp::TensorCoreTileLoader<2, 2>;
@@ -210,13 +217,18 @@ struct LoadPackedBTestKernel {
     static constexpr int kPackedBSizePerIter = kB_Nloads * kB_Kloads * PackedBLoader::kByteSize;
     static constexpr int kPackedBSizePerWarp = kPackedBSizePerIter * kStages;
     static constexpr int kPackedBSize = kPackedBSizePerWarp * kWarps;
-    cutlass::AlignedBuffer<uint8_t, kPackedBSize> operand_B;
+    cutlass::AlignedBuffer<uint8_t, kPackedBSize> shared_B;
 
     /// Buffer for A tensor
     static constexpr int kASizePerIter = kA_Mloads * kA_Kloads * ATileLoader::kByteSize / kElementSize;
     static constexpr int kASizePerWarp = kASizePerIter * kStages;
     static constexpr int kASize = kASizePerWarp * kWarps;
-    cutlass::AlignedBuffer<ElementT, kASize> operand_A;
+    cutlass::AlignedBuffer<ElementT, kASize> shared_A;
+
+    /// Buffer for accumulators of the partial results
+    static constexpr int kAccSizePerWarp = WarpShape::kM * WarpShape::kN;
+    static constexpr int kAccSize = kAccSizePerWarp * (kWarps - 1);
+    cutlass::AlignedBuffer<float, kAccSize> shared_Acc;
   };
 
   //
@@ -402,10 +414,10 @@ struct LoadPackedBTestKernel {
       k_start * kElementSize, k_end * kElementSize, // need to convert to byte based index
       lane_idx};
 
-    if constexpr (kDebugPrint) {
+    if constexpr (kDebugPrintB || kDebugPrintFragA || kDebugPrintC) {
       if (lane_idx == 0) {
-        printf("Warp: %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
-          warp_idx, k_start, k_end, packed_n_start, packed_n_end);
+        printf("Warp: %d, m_start %d, m_end %d, n_start %d, n_end %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
+          warp_idx, m_start, m_end, n_start, n_end, k_start, k_end, packed_n_start, packed_n_end);
       }
     }
 
@@ -413,9 +425,9 @@ struct LoadPackedBTestKernel {
     int proc_k = k_start; // current k index for reading from shared memory and processing
     int smem_write_stage = 0;
     int smem_read_stage = 0;
-    uint8_t* packed_b_shared_ptr = shared_storage.operand_B.data() + 
+    uint8_t* packed_b_shared_ptr = shared_storage.shared_B.data() + 
       SharedStorage::kPackedBSizePerWarp * warp_idx;
-    ElementT* a_shared_ptr = shared_storage.operand_A.data() + 
+    ElementT* a_shared_ptr = shared_storage.shared_A.data() + 
       SharedStorage::kASizePerWarp * warp_idx;
 
     //
@@ -451,10 +463,10 @@ struct LoadPackedBTestKernel {
     // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
     cutlass::arch::cp_async_wait<kStages - 2>();
     //__syncthreads(); is this necessary since the loader is warp based?
-    if constexpr(kDebugPrint) {
+    if constexpr(kDebugPrintB) {
       if (lane_idx == 0) {
         printf("Prologue, warp: %d, ShapredPtr: %p, WarpPtr: %p\n",
-          warp_idx, shared_storage.operand_A.data(), a_shared_ptr);
+          warp_idx, shared_storage.shared_A.data(), a_shared_ptr);
         printf("\n********Dumping the shared memory of Warp %d*******\n\n", warp_idx);
 
         for (int i = 0; i < SharedStorage::kASizePerWarp; i += 8) {
@@ -499,7 +511,7 @@ struct LoadPackedBTestKernel {
             PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, lane_idx, packed_b_smem_read_ptr);
             packed_b_smem_read_ptr += PackedBLoader::kByteSize;
 
-            if constexpr (kDebugPrint) {
+            if constexpr (kDebugPrintB) {
               uint8_t const* ptr = reinterpret_cast<uint8_t const*>(packed_b_tile_frag_ptr->data());
               printf("Warp: %d, lane %2d, smem_read_ptr %p, %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d\n",
                 warp_idx, lane_idx, packed_b_smem_read_ptr, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
@@ -556,36 +568,101 @@ struct LoadPackedBTestKernel {
       // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
       cutlass::arch::cp_async_wait<kStages - 2>();
       //__syncthreads(); is this necessary since the loader is warp based?
-      if constexpr(kDebugPrint) {
+
+      if constexpr(kDebugPrintB) {
         if (lane_idx == 0) {
           printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
             warp_idx, proc_k, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
         }
-        cutlass::debug::dump_shmem(shared_storage.operand_B.data(), SharedStorage::kPackedBSize);
+        cutlass::debug::dump_shmem(shared_storage.shared_B.data(), SharedStorage::kPackedBSize);
+      }
+    }
+
+    if constexpr (kDebugPrintC) {
+      static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
+      for (int warp = 0; warp < kWarps; ++warp) {
+        if (warp_idx == warp) {
+          const float* c_ptr = accumulators.data();
+          const int lane_id = threadIdx.x % 32;
+          if (lane_id == 0) {
+            printf("======= C tiles in warp %d =======\n", warp_idx);
+          }
+          const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
+          for (int n_tile = 0; n_tile < (WarpShape::kN / InstructionShape::kN); ++n_tile) {
+            for (int m_tile = 0; m_tile < (WarpShape::kM / InstructionShape::kM); ++m_tile, c_ptr += 4) {
+              // since InstructionShape::kM is 16, we can print 2 tiles
+              printf(format, float(c_ptr[0]), float(c_ptr[1]));
+              printf(format, float(c_ptr[2]), float(c_ptr[3]));
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+
+    // Finished the main loop, now each warp (except warp 0) stores the partial results
+    // to shared memory. Later warp 0 should gather them to form the final result
+    using Float4 = cutlass::Array<float, 4>;  // hopefully utilize 128b st.shared.b128
+    constexpr int kAccLoads = MmaOp::FragmentC::kElements / 4;
+    static_assert(kAccLoads * 4 == MmaOp::FragmentC::kElements);
+    if (warp_idx != 0){
+      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc.data() + ((warp_idx - 1) * SharedStorage::kAccSizePerWarp));
+      d_smem_ptr += lane_idx;
+      Float4* f4s = reinterpret_cast<Float4*>(accumulators.data());
+      CUTLASS_PRAGMA_UNROLL
+      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l) {
+        d_smem_ptr[0] = f4s[acc_l];
+        d_smem_ptr += 32;
       }
     }
 
     cutlass::arch::cp_async_wait<0>();
-    __syncthreads();
+    if constexpr (kWarps > 1) {
+      __syncthreads();
+    }
 
-    //TODO!!! gather the result from all warps
+    if (warp_idx != 0) {
+      return;
+    }
 
-    if constexpr (kDebugPrintC) {
-      static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
-      const float* c_ptr = accumulators.data();
-      const int lane_id = threadIdx.x % 32;
-      if (lane_id == 0) {
-        printf("====  C tiles =======\n");
-      }
-      const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-      for (int n_tile = 0; n_tile < (WarpShape::kN / InstructionShape::kN); ++n_tile) {
-        for (int m_tile = 0; m_tile < (WarpShape::kM / InstructionShape::kM); ++m_tile, c_ptr += 4) {
-          // since InstructionShape::kM is 16, we can print 2 tiles
-          printf(format, float(c_ptr[0]), float(c_ptr[1]));
-          printf(format, float(c_ptr[2]), float(c_ptr[3]));
+    //
+    // Only warp 0 gathers the result from all other warps and stores it to global memory
+    // Be extra careful with synchronization code below, as only a subset of threads
+    // are active!
+    //
+    Float4 other_acc;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int warp = 1; warp < kWarps; ++warp) {
+      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc.data() + ((warp - 1) * SharedStorage::kAccSizePerWarp));
+      d_smem_ptr += lane_idx;
+
+      if constexpr (kDebugPrintC) {
+        if (lane_idx == 0) {
+          printf("======= C gatered from warp %d =======\n", warp);
         }
       }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l) {
+        other_acc = d_smem_ptr[0];
+        d_smem_ptr += 32;
+
+        if constexpr (kDebugPrintC) {
+          const char* const format = (lane_idx == 31) ? "%f, %f\n\n" : ((lane_idx % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
+          printf(format, float(other_acc[0]), float(other_acc[1]));
+          printf(format, float(other_acc[2]), float(other_acc[3]));
+        }
+
+        accumulators[acc_l * 4 + 0] += other_acc[0];
+        accumulators[acc_l * 4 + 1] += other_acc[1];
+        accumulators[acc_l * 4 + 2] += other_acc[2];
+        accumulators[acc_l * 4 + 3] += other_acc[3];
+      }
+
+
     }
+
 
     // Store the result
     __half2* output_ptr = reinterpret_cast<__half2*>(params.ptr_output_);
@@ -840,35 +917,26 @@ void test_load_packed_b(int m, int n, int k) {
       float diff_ratio = fabs(expected - actual) / max(fabs(expected), fabs(actual)); 
       if (diff_ratio > 3e-3) {
         std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " ratio: " << diff_ratio << std::endl;
-        EXPECT_TRUE(false);
+        ASSERT_TRUE(false);
       }
     }
   }
-  // if (!passed) {
-  //   std::cout << "Mismatch found in test_load_packed_b!" << std::endl;
-  //   std::cout << " ====== Expected: ======" << std::endl;
-  //   print_tiled_tensor(tensor_ref_d);
-  //   std::cerr << " ====== Actual: ======" << std::endl;
-  //   print_tiled_tensor(tensor_d);
-  // }
 }
 
 TEST(TensorCoreLoader, PackedBTest) {
-  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<16, 16, 64>, 1, 4>(21, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(1, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
-  // test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<16, 64, 16>, 4, 2>(31, 128 + 32, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<128, 1>, cutlass::gemm::GemmShape<16, 64, 16>, 8, 3>(67, 128 + 16, 4096 + 128);
 
-  // test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
-  test_load_packed_b<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<64, 32, 32>, 1, 3>(70, 128, 512 + 16);
-  test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 1, 3>(70, 48, 64 * 7);
-  // test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(65, 48, 1024 + 128);
+  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<16, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+
+  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 3>(35, 48, 32 * 4 + 16);
+  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 2>(35, 48, 32 * 3 + 16);
+  test_load_packed_b<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
 
   test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
   test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 4>(170, 176, 2048 + 32);
-
-  // test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 4>(64, 64, 64);
 }
 
 } // namespace test
