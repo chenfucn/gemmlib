@@ -1,57 +1,44 @@
-/**
+/***************************************************************************************************
  * Copyright (c) Microsoft.
  * Licensed under the MIT license.
  *
- * @file tensor_core_tile_loader_test.cu
- */
+ * @file kernel/quant_b4_gemm.h
+ * @brief Fused GEMM kernel for fp16 x int4, where B matrix is blockwise quantized to 4bits.
+ *
+ **************************************************************************************************/
 
-#include <cuda.h>
-#include "cutlass/aligned_buffer.h"
+#pragma once
+
 #include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h"
+#include "cutlass/aligned_buffer.h"
 #include "cutlass/gemm_coord.h"
 #include "cutlass/matrix_shape.h"
-
 #include "cutlass/arch/mma.h"
 #include "cutlass/gemm/warp/mma_tensor_op.h"
 #include "cutlass/gemm/warp/mma_tensor_op_policy.h"
 
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/debug.h"
-
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
-
-#include "matrix_layout.h"
-#include "blkq4_fp16_util.h"
-#include "blkq4_fp16_gemm_sm80.h"
-#include "ref_gemm.h"
-
 #include "gemm/warp/tensor_core_tile_loader.h"
 #include "gemm/warp/quantb_meta_loader.h"
 
-#include "gtest/gtest.h"
+#include "int_util.h"
+
+namespace mickey {
+namespace gemm {
+namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace onnxruntime {
-namespace cuda {
-namespace test {
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
+/**
+ * @brief Fused GEMM kernel for fp16 x int4, where B matrix is blockwise quantized to 4bits.
+ */
 template <
-  typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
-  bool     has_quant_offset_,           ///! Whether the quantization has offset
-  typename WarpShape_,                  ///! Warp-scoped matrix multiply-accumulate
-  int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
-  int Stages_ = 4                       ///! Stages of the pipelined mainloop
+  typename QuantBlocking_,     ///! Shape of the quantization block, either 1xb or bx1
+  bool     has_quant_offset_,  ///! Whether the quantization has offset
+  typename WarpShape_,         ///! Warp-scoped matrix multiply-accumulate
+  int SplitKSerial_ = 1,       ///! How many warps to split the K dimension in the same MxN block
+  int Stages_ = 4              ///! Stages of the pipelined mainloop
 >
-struct LoadPackedBTestKernel {
+struct QuantB4Gemm {
  public:
   //
   // Type definitions
@@ -59,32 +46,36 @@ struct LoadPackedBTestKernel {
 
   using QuantBlocking = QuantBlocking_;
   using WarpShape = WarpShape_;
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+  using ElementT = cutlass::half_t;
   static constexpr bool has_quant_offset = has_quant_offset_;
   static constexpr int kSplitK = SplitKSerial_;
   static constexpr int kStages = Stages_;
+  static constexpr int kElementSize = sizeof(ElementT);
 
+  //
+  // Type constraints verifications:
+  //
   static_assert(kSplitK > 0 && ((kSplitK - 1) & kSplitK) == 0,
      "SplitK must be positive and a power of 2");
-  static_assert(kStages > 1,
-     "Number of pipeline stages must be greater than 1.");
+  static_assert(kStages > 1, "Number of pipeline stages must be greater than 1.");
+  static_assert(kElementSize == 2, "Only support 16b float types.");
+
+  // Quantized weights are packed int4, each 16x16 tile of int4
+  // is packed into 8x8 tile of 16b (i.e. 8x16 tile of bytes)
+  static_assert(WarpShape::kN % 16 == 0 && WarpShape::kK % 16 == 0,
+    "Weight B is packed as 16x16 tiles, warp shape must contain whole tiles!");
+
+  // Need to explore the way to relax this for very small m value.
+  static_assert(WarpShape::kM % 16 == 0,
+      "Stride M smaller than mma instruction shape is not yet supported!");
 
   /// switches for debug print
   static constexpr bool kDebugPrintB = false;
   static constexpr bool kDebugPrintFragA = false;
   static constexpr bool kDebugPrintC = false;
 
-  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
-  using ElementT = cutlass::half_t;
-  static constexpr int kElementSize = sizeof(ElementT);
-  static_assert(kElementSize == 2, "Only support 16b float now");
-
-  // Quantized weights are packed int4, each 16x16 tile of int4
-  // is packed into 8x8 tile of 16b (i.e. 8x16 tile of bytes)
-  static_assert(WarpShape::kN % 16 == 0 && WarpShape::kK % 16 == 0,
-    "Weight B is packed as 16x16 tiles, warp shape must contain whole tiles!");
   using WarpPackedBShape = cutlass::gemm::GemmShape<1, WarpShape::kN/2, WarpShape::kK>;
-
-  // decide per warp tile loader shape, it loads 1, 2 or 4 tiles at a time
   static constexpr int kNTilesPerLoad = std::min(4, WarpPackedBShape::kN / 8);
   static constexpr int kKTilesPerLoad = std::min(4/kNTilesPerLoad, WarpPackedBShape::kK / 16);
   using PackedBLoader = mickey::gemm::warp::TensorCoreTileLoader<kNTilesPerLoad, kKTilesPerLoad>;
@@ -97,10 +88,6 @@ struct LoadPackedBTestKernel {
 
   using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
 
-  // Need to explore the way to relax this for very small m value.
-  static_assert(WarpShape::kM % 16 == 0,
-      "Stride M smaller than mma instruction shape is not yet supported!");
-
   // load A to shared memory, 2x2 tile to match the tensorcore shape 16x8x16
   using ATileLoader = mickey::gemm::warp::TensorCoreTileLoader<2, 2>;
   static_assert(ATileLoader::kMNStride == InstructionShape::kM);
@@ -108,17 +95,15 @@ struct LoadPackedBTestKernel {
   static constexpr int kA_Mloads = WarpShape::kM / InstructionShape::kM;
   static constexpr int kA_Kloads = WarpShape::kK / InstructionShape::kK;
 
-  // Since int4 weights are packed (16x16) -> (8x8), each tile is expanded to 4 tiles when
-  // de-quantized to 16b float.
-
-  // Fragments of quantized weights, keep all warp tile in registers for it's easier to
-  // locate corresponding scale
+  // Fragments of quantized weights, keep entire warp tile in registers to maximize
+  // the reuse of shared scale/offsets
   using FragmentPackedB = cutlass::Array<
       unsigned,  // 8 of int4 weights each tile (becomes 4 tiles when de-quantized)
       PackedBLoader::kTiles * kB_Nloads * kB_Kloads>;
 
-  // Fragments for operand A and B, each tile has 2 elements per thread. In each iteration,
-  // we use a (WarpShape::kM, 16) block of A and (16, WarpShape::kN) block of B for mma
+  // Fragments for operand A and dequantized B, each tile has 2 elements per thread.
+  // In each main loop iteration, we use a (WarpShape::kM, 16) block of A and
+  // (16, WarpShape::kN) block of B for mma
   using FragmentA = cutlass::Array<ElementT, 2 * (WarpShape::kM / 8) * 2>;
   using FragmentB = cutlass::Array<ElementT, 2 * (WarpShape::kN / 8) * 2>;
 
@@ -142,7 +127,6 @@ struct LoadPackedBTestKernel {
   // else the operation can not be used. This is a serious abstraction leak
   // that makes this class difficult to use.
   //
-
   using MmaPolicy = cutlass::gemm::warp::MmaTensorOpPolicy<
       cutlass::arch::Mma<InstructionShape, 32, ElementT,
                          cutlass::layout::RowMajor, ElementT,
@@ -236,77 +220,77 @@ struct LoadPackedBTestKernel {
   //
 
   CUTLASS_HOST_DEVICE
-  LoadPackedBTestKernel() { }
+  QuantB4Gemm() { }
 
   /// Determines whether kernel satisfies alignment
   static cutlass::Status can_implement(const Params &params) {
     if ((reinterpret_cast<uintptr_t>(params.ptr_a_) % 16)) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_a_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.ptr_a_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.a_byte_stride_ % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.a_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.a_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if ((params.problem_size_.k() % QuantBlocking::kRow != 0) ||
         (params.problem_size_.n() % QuantBlocking::kColumn) != 0){
-      std::cerr << "LoadPackedBTestKernel validation fail: partial quantization block not supported!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: partial quantization block not supported!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
     if (reinterpret_cast<uintptr_t>(params.ptr_packed_b_) % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_packed_b_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.ptr_packed_b_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.b_byte_stride_ % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.b_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.b_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (reinterpret_cast<uintptr_t>(params.ptr_scales_) % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_scales_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.ptr_scales_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.scales_byte_stride_ % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.scales_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.scales_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if constexpr (has_quant_offset) {
       if (params.ptr_offsets_ == nullptr || params.offsets_byte_stride_ == 0) {
-        std::cerr << "LoadPackedBTestKernel validation fail: Required quantization offsets are not provided!" << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: Required quantization offsets are not provided!" << std::endl;
         return cutlass::Status::kErrorInvalidProblem;
       }
       if (reinterpret_cast<uintptr_t>(params.ptr_offsets_) % 16) {
-        std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_offsets_ is not aligned to 16 bytes!" << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: params.ptr_offsets_ is not aligned to 16 bytes!" << std::endl;
         return cutlass::Status::kErrorMisalignedOperand;
       }
       if (params.offsets_byte_stride_ % 16) {
-        std::cerr << "LoadPackedBTestKernel validation fail: params.offsets_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: params.offsets_byte_stride_ is not aligned to 16 bytes!" << std::endl;
         return cutlass::Status::kErrorMisalignedOperand;
       }
     } else {
       if (params.ptr_offsets_ != nullptr || params.offsets_byte_stride_ != 0) {
-        std::cerr << "LoadPackedBTestKernel validation fail: quantization offsets are provided to scale only kernel!" << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: quantization offsets are provided to scale only kernel!" << std::endl;
         return cutlass::Status::kErrorInvalidProblem;
       }
     }
 
     if (reinterpret_cast<uintptr_t>(params.ptr_output_) % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.ptr_output_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.ptr_output_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.output_byte_stride_ % 16) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.output_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.output_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.problem_size_.n() > (params.output_byte_stride_ / kElementSize)) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.problem_size_.n() is greater than params.output_byte_stride_!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.problem_size_.n() is greater than params.output_byte_stride_!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
     if (params.problem_size_.k() % 16 != 0) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
     if (params.problem_size_.k() > params.b_byte_stride_) {
-      std::cerr << "LoadPackedBTestKernel validation fail: params.problem_size_.k() is greater than params.b_byte_stride_!" << std::endl;
+      std::cerr << "QuantB4Gemm validation fail: params.problem_size_.k() is greater than params.b_byte_stride_!" << std::endl;
       // for gemm of 16b floats, weights is packed to shape (k/2,n/2), column major
       // so stride should be greater or equal to k/2, with element size 2, it should be k
       return cutlass::Status::kErrorInvalidProblem;
@@ -317,7 +301,7 @@ struct LoadPackedBTestKernel {
       int remain = params.problem_size_.k() % params.gemm_k_size_;
       if (remain > 0 && remain < WarpShape::kK * kStages * 2) {
         // spliting too small, may not get enough iterations to rampup pipeline
-        std::cerr << "LoadPackedBTestKernel validation fail: kSplitK is too small, k: " << remain << " is smaller than " << (WarpShape::kK * kStages * 4) << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: kSplitK is too small, k: " << remain << " is smaller than " << (WarpShape::kK * kStages * 4) << std::endl;
         return cutlass::Status::kErrorNotSupported;
       }
     }
@@ -684,261 +668,7 @@ struct LoadPackedBTestKernel {
   }
 };
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <
-  typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
-  typename WarpShape_,                  ///! Warp-scoped matrix multiply-accumulate
-  int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
-  int Stages_ = 4                       ///! Stages of the pipelined mainloop
->
-class LoadPackedBTest {
- public:
-  using QuantBlocking = QuantBlocking_;
-  using WarpShape = WarpShape_;
-  static constexpr int kSplitK = SplitKSerial_;
-  static constexpr int kStages = Stages_;
-
-  using TestKernel = LoadPackedBTestKernel<QuantBlocking, false, WarpShape, kSplitK, kStages>;
-  using Args = typename TestKernel::Params;
-
-  cutlass::Status run(
-    cudaStream_t stream,
-    cutlass::gemm::GemmCoord const & problem_size,
-    void* ptr_output,
-    int output_byte_stride,
-    void const *ptr_a,
-    int a_byte_stride,
-    void const *ptr_packed_b,
-    int b_byte_stride,
-    void const *ptr_scales,
-    int scales_byte_stride) {
-
-    Args args(problem_size, ptr_output, output_byte_stride,
-              ptr_a, a_byte_stride, ptr_packed_b, b_byte_stride,
-              ptr_scales, scales_byte_stride);
-    cutlass::Status status = TestKernel::can_implement(args);
-    if (status != cutlass::Status::kSuccess) {
-      return status;
-    }
-
-    dim3 grid(args.grid_tiled_shape_.m(), args.grid_tiled_shape_.n(), args.grid_tiled_shape_.k());
-    dim3 block(TestKernel::kThreadCount, 1, 1);
-
-    cudaError_t result;
-
-    int smem_size = int(sizeof(typename TestKernel::SharedStorage));
-
-    if (smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(cutlass::Kernel<TestKernel>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    smem_size);
-
-      if (result != cudaSuccess) {
-        std::cerr << "Failed to obtain maximum shared memory size " << smem_size << " for kernel: "
-                  << cudaGetErrorString(result) << "\n";
-        return cutlass::Status::kErrorInternal;
-      }
-    }
-   
-    cutlass::Kernel<TestKernel><<<grid, block, smem_size, stream>>>(args);
-
-    return cutlass::Status::kSuccess;
-  }
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename LayoutT, typename ElementT>
-void print_tiled_tensor(cutlass::HostTensor<ElementT, LayoutT>& t) {
-  for (int row = 0; row < t.extent()[0]; ++row) {
-    for (int col = 0; col < t.extent()[1]; ++col) {
-      printf("%f, ", static_cast<float>(t.at({row, col})));
-      if (col % 8 == 7) {
-        printf(", ");
-      }
-    }
-    printf("\n");
-    if (row % 8 == 7) {
-      printf("\n");
-    }
-  }
-}
-
-
-template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
-void test_load_packed_b(int m, int n, int k) {
-  std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
-            << " WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
-            << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
-  std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
-
-  using Test = LoadPackedBTest<QuantBlocking, WarpShape, kSplitK, kStages>;
-  Test test;
-  cutlass::gemm::GemmCoord problem_size(m, n, k);
-
-  constexpr bool has_offsets = false;
-  using QuantBaseT = onnxruntime::test::BlkQuantizationRef<QuantBlocking, has_offsets>;
-  using LayoutQMeta = typename QuantBaseT::LayoutQMeta;
-
-  // fill the tensor with reduced bits fp16 seems to be necessary to avoid rounding errors
-  // during test. Need to investigate further why.
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_a({m, k});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 174321, 1.5f, -1.125f, 6);
-
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_b({k, n});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 193456, 1.75f, -1.25f, 8);
-  cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> q4_weights;
-  cutlass::HostTensor<cutlass::half_t, LayoutQMeta> scales;
-  cutlass::HostTensor<uint8_t, LayoutQMeta> offsets;
-
-  QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
-  QuantBaseT::Dequantize4BitToFp16(tensor_b, q4_weights, scales, offsets);
-  QuantBaseT::QuantizeFp16To4Bit(tensor_b, q4_weights, scales, offsets);
-  cutlass::reference::host::TensorFill(tensor_b.host_view(), cutlass::half_t(0));
-
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> dst;
-  QuantBaseT::Dequantize4BitToFp16(dst, q4_weights, scales, offsets);
-
-  // Allocate result tensor
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_d(
-      problem_size.mn());
-  cutlass::reference::host::TensorFill(tensor_d.host_view());
-
-#if 0
-  // Debug print the weights tensor detail
-  for (int row = 0; row < k; ++row) {
-    for (int col = 0; col < n; ++col) {
-      auto weight_pos = cutlass::make_Coord(row/2, col);
-      auto meta_pos = cutlass::make_Coord(row / QuantBlocking::kRow, col / QuantBlocking::kColumn);
-      const float scale = static_cast<float>(scales.at(meta_pos));
-      const uint8_t offset = has_offsets ? offsets.at(meta_pos) : 8;
-      const int w = (row % 2 == 0) ? (q4_weights.at(weight_pos) & 0xf) : (q4_weights.at(weight_pos) >> 4);
-
-      const float f = scale * (w - offset);
-      printf("%f=%2dx%f,  ", float(dst.at({row, col})), w, scale);
-      ASSERT_EQ(dst.at({row, col}), cutlass::half_t(f));
-    }
-    printf("\n");
-  }
-
-  // Debug print the tensor A
-  for (int row = 0; row < tensor_a.extent()[0]; ++row) {
-    for (int col = 0; col < tensor_a.extent()[1]; ++col) {
-      printf("%f, ", float(tensor_a.at({row, col})));
-    }
-    printf("\n");
-  }
-#endif
-
-  std::vector<uint8_t> packed_w_ref(k * n / 2);
-  mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_packed_w_ref(
-      packed_w_ref, cutlass::make_Coord(k, n / 2));
-  onnxruntime::cuda::test::prepack_weights_ref(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
-
-  int meta_tensor_stride = scales.stride(0);
-  thrust::device_vector<cutlass::half_t> packed_scale_dev;
-
-  if constexpr (std::is_same<LayoutQMeta, cutlass::layout::ColumnMajor>::value) {
-    std::vector<cutlass::half_t> packed_scales_ref(scales.size());
-    mickey::MatrixRef<cutlass::half_t, LayoutQMeta, true> tensor_packed_s_ref =
-        mickey::make_MatrixRef<cutlass::half_t, LayoutQMeta, true>(packed_scales_ref, scales.extent());
-    onnxruntime::cuda::test::prepack_quant_scales_ref<cutlass::half_t, LayoutQMeta, QuantBlocking>(
-        k, n, onnxruntime::test::make_ConstMatrixRef(scales), tensor_packed_s_ref);
-    packed_scale_dev = packed_scales_ref;
-  
-    // std::vector<uint8_t> packed_zp_ref(meta_shape.product());
-    // mickey::MatrixRef<uint8_t, LayoutQMeta, true> tensor_packed_zp_ref =
-    //     mickey::make_MatrixRef<ElementQOffset, LayoutQMeta, true>(packed_zp_ref, meta_shape);
-    // onnxruntime::cuda::test::prepack_quant_offsets_ref<LayoutQMeta, QuantBlocking>(
-    //       rows, columns, tensor_offset.const_ref(), tensor_packed_zp_ref);
-  } else {
-    packed_scale_dev.resize(scales.size());
-    thrust::copy(scales.host_data(), scales.host_data() + scales.size(), packed_scale_dev.begin());
-  }
-
-  thrust::device_vector<uint8_t> packed_w_dev(packed_w_ref);
-  tensor_d.sync_device();
-  tensor_a.sync_device();
-
-  cutlass::Status status = test.run(nullptr, problem_size,
-                                    tensor_d.device_data(), tensor_d.stride(0) * sizeof(cutlass::half_t),
-                                    tensor_a.device_data(), tensor_a.stride(0) * sizeof(cutlass::half_t),
-                                    thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
-                                    thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
-  ASSERT_EQ(status, cutlass::Status::kSuccess);
-  tensor_d.sync_host();
-
-  // Run reference kernel
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_ref_d(
-      problem_size.mn());  // <- Create matrix D with dimensions M x N used to store output from
-                           // reference kernel
-  cutlass::reference::host::TensorFill(tensor_ref_d.host_view());
-  cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_c(
-      problem_size.mn());
-  cutlass::reference::host::TensorFill(tensor_c.host_view());
-
-  tensor_ref_d.sync_device();
-  tensor_c.sync_device();
-  dst.sync_device();
-
-  // Initialize alpha and beta for dot product computation
-  float alpha = 1.0f;
-  float beta = 0.0f;
-
-  compute_gemm_ref<cutlass::half_t, cutlass::layout::RowMajor,
-                   cutlass::half_t, cutlass::layout::RowMajor,
-                   cutlass::half_t, cutlass::layout::RowMajor,
-                   float, float>(
-      problem_size,
-      alpha,
-      tensor_a.device_ref(),
-      dst.device_ref(),
-      beta,
-      tensor_c.device_ref(),
-      tensor_ref_d.device_ref());
-
-  // Wait for kernels to finish
-  cudaDeviceSynchronize();
-
-  tensor_ref_d.sync_host();
-
-  for (int row = 0; row < tensor_d.extent()[0]; ++row) {
-    for (int col = 0; col < tensor_d.extent()[1]; ++col) {
-      float expected = tensor_ref_d.at({row, col});
-      float actual = tensor_d.at({row, col});
-      if (expected == actual) {
-        continue;
-      }
-      float diff = fabs(expected - actual);
-      if (diff < 2e-7) {
-        continue;
-      }
-      float diff_ratio = fabs(expected - actual) / max(fabs(expected), fabs(actual)); 
-      if (diff_ratio > 3e-3) {
-        std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " ratio: " << diff_ratio << std::endl;
-        ASSERT_TRUE(false);
-      }
-    }
-  }
-}
-
-TEST(TensorCoreLoader, PackedBTest) {
-  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<16, 64, 16>, 4, 2>(31, 128 + 32, 1024 + 16);
-  test_load_packed_b<cutlass::MatrixShape<128, 1>, cutlass::gemm::GemmShape<16, 64, 16>, 8, 3>(67, 128 + 16, 4096 + 128);
-
-  test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(65, 48, 1024 + 128);
-  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<16, 16, 64>, 4, 4>(1, 128, 4096 + 16);
-
-  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 3>(35, 48, 32 * 4 + 16);
-  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 2>(35, 48, 32 * 3 + 16);
-  test_load_packed_b<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
-  test_load_packed_b<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
-
-  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
-  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 4>(170, 176, 2048 + 32);
-}
-
-} // namespace test
-} // namespace cuda
-} // namespace onnxruntime
+}  // namespace kernel
+}  // namespace gemm
+}  // namespace mickey
