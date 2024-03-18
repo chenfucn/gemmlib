@@ -26,6 +26,24 @@ namespace mickey {
 namespace gemm {
 namespace kernel {
 
+template<typename ElementT, typename Shape, int Stages>
+struct MmaLoopSharedBuffer{
+  // Quantized weights are packed int4, each 16x16 tile of int4
+  // is packed into 8x8 tile of 16b (i.e. 8x16 tile of bytes)
+  using PackedBShape = cutlass::MatrixShape<Shape::kK, Shape::kN/2>;
+  static_assert(sizeof(ElementT) == 2, "Only support 16b float types.");
+
+  /// Buffer for prepacked weights
+  static constexpr int kPackedBSizePerIter = PackedBShape::kCount;
+  static constexpr int kPackedBSize = kPackedBSizePerIter * Stages;
+  cutlass::AlignedBuffer<uint8_t, kPackedBSize> shared_B;
+
+  /// Buffer for A tensor
+  static constexpr int kASizePerIter = Shape::kM * Shape::kK;
+  static constexpr int kASize = kASizePerIter * Stages;
+  cutlass::AlignedBuffer<ElementT, kASize> shared_A;
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -95,6 +113,43 @@ struct QuantB4Gemm {
   static constexpr int kA_Mloads = WarpShape::kM / InstructionShape::kM;
   static constexpr int kA_Kloads = WarpShape::kK / InstructionShape::kK;
 
+  static constexpr int kWarps = kSplitK; // TODO! more warps when we have a larger thread block shape
+  static int const kThreadCount = 32 * kWarps;
+
+  using MainLoopSharedBuffer = MmaLoopSharedBuffer<ElementT, WarpShape, kStages>;
+  static_assert(MainLoopSharedBuffer::kPackedBSizePerIter == kB_Nloads * kB_Kloads * PackedBLoader::kByteSize);
+  static_assert(MainLoopSharedBuffer::kASizePerIter == kA_Mloads * kA_Kloads * ATileLoader::kByteSize / kElementSize);
+
+  //
+  // Each warp has its own shared memory buffer, and writes partial results
+  // to shared_Acc only after the main loop. Thus we can use `union' to save
+  // shared memory space.
+  // 
+  // On the other hand, we also wasted a little bit of shared memory.
+  // Technically, we only need (kWarps - 1) shared_Acc buffers. But we
+  // declare kWarps of those buffers, so that we can isolate the shared
+  // memory buffer for each warp. Since different warps finish the main
+  // loop at different times, we don't want the warp that finishes early
+  // to overwrite the shared memory buffer of the warp that still working
+  // on the main loop.  An extra __syncthreads can be used to avoid this,
+  // but we don't like the performance impact of it.
+  //
+  // TODO!! need to reconsider this when we have a thread block shape
+  // larger than warp shape.
+  //
+  union WarpSmemT {
+    MainLoopSharedBuffer main_loop;
+
+    /// Buffer for accumulators of the partial results after the main loop
+    static constexpr int kAccSizePerWarp = WarpShape::kM * WarpShape::kN;
+    cutlass::AlignedBuffer<float, kAccSizePerWarp> shared_Acc;
+  };
+
+  /// Shared memory storage structure
+  struct SharedStorage {
+    WarpSmemT smem[kWarps];
+  };
+
   // Fragments of quantized weights, keep entire warp tile in registers to maximize
   // the reuse of shared scale/offsets
   using FragmentPackedB = cutlass::Array<
@@ -106,9 +161,6 @@ struct QuantB4Gemm {
   // (16, WarpShape::kN) block of B for mma
   using FragmentA = cutlass::Array<ElementT, 2 * (WarpShape::kM / 8) * 2>;
   using FragmentB = cutlass::Array<ElementT, 2 * (WarpShape::kN / 8) * 2>;
-
-  static constexpr int kWarps = kSplitK; // TODO! more warps when we have a larger thread block shape
-  static int const kThreadCount = 32 * kWarps;
 
   //
   // The way we use the cutlass MmaTensorOp class below is confusing, because:
@@ -193,26 +245,6 @@ struct QuantB4Gemm {
         mickey::div_up(problem_size.m(), WarpShape::kM),
         mickey::div_up(problem_size.n(), WarpShape::kN),
         1)) { }
-  };
-
-  /// Shared memory storage structure
-  struct SharedStorage {
-    /// Buffer for prepacked weights
-    static constexpr int kPackedBSizePerIter = kB_Nloads * kB_Kloads * PackedBLoader::kByteSize;
-    static constexpr int kPackedBSizePerWarp = kPackedBSizePerIter * kStages;
-    static constexpr int kPackedBSize = kPackedBSizePerWarp * kWarps;
-    cutlass::AlignedBuffer<uint8_t, kPackedBSize> shared_B;
-
-    /// Buffer for A tensor
-    static constexpr int kASizePerIter = kA_Mloads * kA_Kloads * ATileLoader::kByteSize / kElementSize;
-    static constexpr int kASizePerWarp = kASizePerIter * kStages;
-    static constexpr int kASize = kASizePerWarp * kWarps;
-    cutlass::AlignedBuffer<ElementT, kASize> shared_A;
-
-    /// Buffer for accumulators of the partial results
-    static constexpr int kAccSizePerWarp = WarpShape::kM * WarpShape::kN;
-    static constexpr int kAccSize = kAccSizePerWarp * (kWarps - 1);
-    cutlass::AlignedBuffer<float, kAccSize> shared_Acc;
   };
 
   //
@@ -307,6 +339,17 @@ struct QuantB4Gemm {
     }
 
     return cutlass::Status::kSuccess;
+  }
+
+  CUTLASS_DEVICE
+  static void advance_stage(int &stage, uint8_t* &packed_b_smem_ptr, ElementT* &a_smem_ptr) {
+    if (stage == kStages - 1) {
+      packed_b_smem_ptr -= kStages * MainLoopSharedBuffer::kPackedBSizePerIter;
+      a_smem_ptr -= kStages * MainLoopSharedBuffer::kASizePerIter;
+      stage = 0;
+    } else {
+      ++stage;
+    }
   }
 
   /// Executes one GEMM
@@ -406,37 +449,33 @@ struct QuantB4Gemm {
     }
 
     int load_k = k_start; // current k index for loading from global memory to shared memory
-    int proc_k = k_start; // current k index for reading from shared memory and processing
     int smem_write_stage = 0;
-    int smem_read_stage = 0;
-    uint8_t* packed_b_shared_ptr = shared_storage.shared_B.data() + 
-      SharedStorage::kPackedBSizePerWarp * warp_idx;
-    ElementT* a_shared_ptr = shared_storage.shared_A.data() + 
-      SharedStorage::kASizePerWarp * warp_idx;
+    uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.smem[warp_idx].main_loop.shared_B.data());
+    ElementT* a_shared_ptr = a_tile_loader.get_smem_lane_ptr(shared_storage.smem[warp_idx].main_loop.shared_A.data());
+
+    uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr;
+    ElementT* a_smem_write_ptr = a_shared_ptr;
 
     //
     // Prologue
     //
     CUTLASS_PRAGMA_UNROLL
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
-      uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
-      ElementT* a_smem_ptr = a_shared_ptr + smem_write_stage * SharedStorage::kASizePerIter;
-
       meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
 
       // Load packed b
       CUTLASS_PRAGMA_UNROLL
       for (int k_load = 0; k_load < kB_Kloads; ++k_load) {
-        packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_ptr);
-        packed_b_smem_ptr += PackedBLoader::kByteSize * kB_Nloads;
+        packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
+        packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
         ++packed_b_loader;
       }
 
       // Load A
       CUTLASS_PRAGMA_UNROLL
       for (int ka_load = 0; ka_load < kA_Kloads; ++ka_load) {
-        a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_ptr);
-        a_smem_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
+        a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_write_ptr);
+        a_smem_write_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
         ++a_tile_loader;
       }
 
@@ -449,11 +488,11 @@ struct QuantB4Gemm {
     //__syncthreads(); is this necessary since the loader is warp based?
     if constexpr(kDebugPrintB) {
       if (lane_idx == 0) {
-        printf("Prologue, warp: %d, ShapredPtr: %p, WarpPtr: %p\n",
-          warp_idx, shared_storage.shared_A.data(), a_shared_ptr);
+        printf("Prologue, warp: %d, WarpPtr: %p\n",
+          warp_idx, a_shared_ptr);
         printf("\n********Dumping the shared memory of Warp %d*******\n\n", warp_idx);
 
-        for (int i = 0; i < SharedStorage::kASizePerWarp; i += 8) {
+        for (int i = 0; i < MainLoopSharedBuffer::kASize; i += 8) {
           for (int j = 0; j < 8; ++j) {
             printf("%f, ", float(a_shared_ptr[i + j]));
           }
@@ -462,17 +501,17 @@ struct QuantB4Gemm {
       }
     }
 
+    int smem_read_stage = 0;
+    uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr;
+    ElementT* a_smem_read_ptr = a_shared_ptr;
+
     //
     // Mainloop
     //
-    for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages, proc_k += WarpShape::kK){
+    CUTLASS_PRAGMA_UNROLL
+    for (int proc_k = k_start; proc_k < k_end; proc_k += WarpShape::kK){
       typename MetaLoader::FragmentScales fragment_addon;
   
-      uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr + smem_read_stage * SharedStorage::kPackedBSizePerIter;
-      uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
-      ElementT* a_smem_read_ptr = a_shared_ptr + smem_read_stage * SharedStorage::kASizePerIter;
-      ElementT* a_smem_write_ptr = a_shared_ptr + smem_write_stage * SharedStorage::kASizePerIter;
-
       meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
       cutlass::Array<unsigned, PackedBLoader::kTiles>* packed_b_tile_frag_ptr =
           reinterpret_cast<cutlass::Array<unsigned, PackedBLoader::kTiles>*>(fragment_packed_b.data());
@@ -492,7 +531,7 @@ struct QuantB4Gemm {
         if ((warp_k_offset % PackedBLoader::kKStride) == 0) {
           CUTLASS_PRAGMA_UNROLL
           for (int n_load = 0; n_load < kB_Nloads; ++n_load, ++packed_b_tile_frag_ptr) {
-            PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, lane_idx, packed_b_smem_read_ptr);
+            PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, packed_b_smem_read_ptr);
             packed_b_smem_read_ptr += PackedBLoader::kByteSize;
 
             if constexpr (kDebugPrintB) {
@@ -502,11 +541,9 @@ struct QuantB4Gemm {
             }
           }
 
-          if (load_k < k_end) {
-            packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
-            packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
-            ++packed_b_loader;
-          }
+          packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
+          packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
+          ++packed_b_loader;
           load_k += PackedBLoader::kKStride;
         }
 
@@ -516,7 +553,7 @@ struct QuantB4Gemm {
 
         CUTLASS_PRAGMA_UNROLL
         for (int m_load = 0; m_load < kA_Mloads; ++m_load, ++a_tile_frag_ptr) {
-          ATileLoader::ldmatrix_sync(*a_tile_frag_ptr, lane_idx, a_smem_read_ptr);
+          ATileLoader::ldmatrix_sync(*a_tile_frag_ptr, a_smem_read_ptr);
           a_smem_read_ptr += ATileLoader::kByteSize / kElementSize;
         }
 
@@ -549,6 +586,9 @@ struct QuantB4Gemm {
       // Defines the boundary of a stage of cp.async.
       cutlass::arch::cp_async_fence();
 
+      advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr);
+      advance_stage(smem_read_stage, packed_b_smem_read_ptr, a_smem_read_ptr);
+
       // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
       cutlass::arch::cp_async_wait<kStages - 2>();
       //__syncthreads(); is this necessary since the loader is warp based?
@@ -558,7 +598,7 @@ struct QuantB4Gemm {
           printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
             warp_idx, proc_k, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
         }
-        cutlass::debug::dump_shmem(shared_storage.shared_B.data(), SharedStorage::kPackedBSize);
+        cutlass::debug::dump_shmem(packed_b_shared_ptr, MainLoopSharedBuffer::kPackedBSize);
       }
     }
 
@@ -584,13 +624,16 @@ struct QuantB4Gemm {
       }
     }
 
+    // ========================== Finish the main loop ==========================
+    // !!!!! SHOULD NOT ACCESS main_loop SHARED MEMORY AFTER THIS POINT !!!!!
+  
     // Finished the main loop, now each warp (except warp 0) stores the partial results
     // to shared memory. Later warp 0 should gather them to form the final result
     using Float4 = cutlass::Array<float, 4>;  // hopefully utilize 128b st.shared.b128
     constexpr int kAccLoads = MmaOp::FragmentC::kElements / 4;
     static_assert(kAccLoads * 4 == MmaOp::FragmentC::kElements);
     if (warp_idx != 0){
-      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc.data() + ((warp_idx - 1) * SharedStorage::kAccSizePerWarp));
+      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.smem[warp_idx].shared_Acc.data());
       d_smem_ptr += lane_idx;
       Float4* f4s = reinterpret_cast<Float4*>(accumulators.data());
       CUTLASS_PRAGMA_UNROLL
@@ -614,12 +657,13 @@ struct QuantB4Gemm {
     // Be extra careful with synchronization code below, as only a subset of threads
     // are active!
     //
-    Float4 other_acc;
+    Float4 other_acc[2];
+    int double_buffer_idx = 0;
+    int frag_idx = 0;
 
     CUTLASS_PRAGMA_UNROLL
     for (int warp = 1; warp < kWarps; ++warp) {
-      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc.data() + ((warp - 1) * SharedStorage::kAccSizePerWarp));
-      d_smem_ptr += lane_idx;
+      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.smem[warp].shared_Acc.data()) + lane_idx;
 
       if constexpr (kDebugPrintC) {
         if (lane_idx == 0) {
@@ -628,25 +672,36 @@ struct QuantB4Gemm {
       }
 
       CUTLASS_PRAGMA_UNROLL
-      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l) {
-        other_acc = d_smem_ptr[0];
+      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l, double_buffer_idx ^= 1) {
+        other_acc[double_buffer_idx] = d_smem_ptr[0];
         d_smem_ptr += 32;
 
         if constexpr (kDebugPrintC) {
           const char* const format = (lane_idx == 31) ? "%f, %f\n\n" : ((lane_idx % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          printf(format, float(other_acc[0]), float(other_acc[1]));
-          printf(format, float(other_acc[2]), float(other_acc[3]));
+          printf(format, float(other_acc[double_buffer_idx][0]), float(other_acc[double_buffer_idx][1]));
+          printf(format, float(other_acc[double_buffer_idx][2]), float(other_acc[double_buffer_idx][3]));
         }
 
-        accumulators[acc_l * 4 + 0] += other_acc[0];
-        accumulators[acc_l * 4 + 1] += other_acc[1];
-        accumulators[acc_l * 4 + 2] += other_acc[2];
-        accumulators[acc_l * 4 + 3] += other_acc[3];
+        if (warp == 1 && acc_l == 0) {
+          continue;
+        }
+
+        const int read_idx = double_buffer_idx ^ 1;
+        accumulators[frag_idx + 0] += other_acc[read_idx][0];
+        accumulators[frag_idx + 1] += other_acc[read_idx][1];
+        accumulators[frag_idx + 2] += other_acc[read_idx][2];
+        accumulators[frag_idx + 3] += other_acc[read_idx][3];
+        frag_idx += 4;
+        frag_idx = frag_idx % MmaOp::FragmentC::kElements;
       }
-
-
     }
-
+    {
+      const int read_idx = double_buffer_idx ^ 1;
+      accumulators[frag_idx + 0] += other_acc[read_idx][0];
+      accumulators[frag_idx + 1] += other_acc[read_idx][1];
+      accumulators[frag_idx + 2] += other_acc[read_idx][2];
+      accumulators[frag_idx + 3] += other_acc[read_idx][3];
+    }
 
     // Store the result
     __half2* output_ptr = reinterpret_cast<__half2*>(params.ptr_output_);

@@ -168,31 +168,56 @@ class TensorCoreTileLoader {
     }
   }
 
+  /**
+   * @brief Get the pointer to the shared memory location for the current lane
+   * @param smem_ptr pointer to the shared memory location for the warp.
+  */
+  template<typename T>
+  CUTLASS_DEVICE
+  T* get_smem_lane_ptr(T* smem_ptr) const {
+    if constexpr (kThreads < 32) {
+      static_assert(kThreads & (kThreads - 1) == 0, "kThreads must be power of 2");
+      return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(smem_ptr) + ((lane_id_ & (kThreads - 1)) << 4));
+    } else {
+      return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(smem_ptr) + (lane_id_ << 4));
+    }
+  }
+
+  template<typename T>
+  CUTLASS_DEVICE
+  T* get_smem_warp_base_ptr(T* smem_lane_ptr) const {
+    if constexpr (kThreads < 32) {
+      static_assert(kThreads & (kThreads - 1) == 0, "kThreads must be power of 2");
+      return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(smem_lane_ptr) - ((lane_id_ & (kThreads - 1)) << 4));
+    } else {
+      return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(smem_lane_ptr) - (lane_id_ << 4));
+    }
+  }
+
+
   /// Loads a tile from global memory to shared memory
   CUTLASS_DEVICE
-  void load_to(void* smem_ptr) const {
+  void load_to(void* smem_lane_ptr) const {
     if constexpr (kThreads < 32) {
       if (lane_id_ >= kThreads) {
         return;
       }
     }
-    uint8_t* smem_ptr_b = reinterpret_cast<uint8_t*>(smem_ptr);
     cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
-              smem_ptr_b + lane_id_ * 16, g_ptr_, g_ptr_ != nullptr);
+        smem_lane_ptr, g_ptr_, g_ptr_ != nullptr);
   }
 
   /// Load from next position in the M or N dimension
   CUTLASS_DEVICE
-  void load_with_mn_offset(void* smem_ptr, int mn_offset) const {
+  void load_with_mn_offset(void* smem_lane_ptr, int mn_offset) const {
     if constexpr (kThreads < 32) {
       if (lane_id_ >= kThreads) {
         return;
       }
     }
     assert(mn_offset > 0 && (mn_offset % kMNStride) == 0);
-    uint8_t* smem_ptr_b = reinterpret_cast<uint8_t*>(smem_ptr);
     cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
-              smem_ptr_b + lane_id_ * 16, g_ptr_ + mn_offset * stride_, g_ptr_ != nullptr && mn_offset < mn_cnt_);
+        smem_lane_ptr, g_ptr_ + mn_offset * stride_, g_ptr_ != nullptr && mn_offset < mn_cnt_);
   }
 
   /// Advances to the next position in the K dimension
@@ -213,20 +238,19 @@ class TensorCoreTileLoader {
 
   template<int MNLoads>
   CUTLASS_DEVICE
-  void load_lateral_n(void* smem_ptr) const {
-    uint8_t* smem_ptr_b = reinterpret_cast<uint8_t*>(smem_ptr);
-    this->load_to(smem_ptr_b);
-    smem_ptr_b += kByteSize;
+  void load_lateral_n(void* smem_lane_ptr) const {
+    uint8_t* smem_bytes = reinterpret_cast<uint8_t*>(smem_lane_ptr);
+    this->load_to(smem_bytes);
+    smem_bytes += kByteSize;
     CUTLASS_PRAGMA_UNROLL
     for (int n_load = 1; n_load < MNLoads; ++n_load) {
-      this->load_with_mn_offset(smem_ptr_b, n_load * kMNStride);
-      smem_ptr_b += kByteSize;
+      this->load_with_mn_offset(smem_bytes, n_load * kMNStride);
+      smem_bytes += kByteSize;
     }
   }
 
   CUTLASS_DEVICE
-  static void ldmatrix_sync(cutlass::Array<unsigned, kTiles>& frag, int lane_id, void const* smem_ptr) {
-    uint8_t const* smem_lane_ptr = reinterpret_cast<uint8_t const*>(smem_ptr) + (lane_id % kThreads) * 16;
+  static void ldmatrix_sync(cutlass::Array<unsigned, kTiles>& frag, void const* smem_lane_ptr) {
     cutlass::arch::ldsm<cutlass::layout::RowMajor, kTiles>(frag, smem_lane_ptr);
   }
 
