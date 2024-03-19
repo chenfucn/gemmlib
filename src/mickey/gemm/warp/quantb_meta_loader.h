@@ -142,9 +142,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
   using FragmentScales = cutlass::Array<ElementT, kMetaFragSize * kMetaChunkCount>;
   // using FragmentOffsets = cutlass::Array<uint8_t, kMetaFragSize * kMetaChunkCount>;
 
-  static constexpr int kBTiles = (WarpShape::kK / 8) * (WarpShape::kN / 8);
-  using FragmentPackedB = cutlass::Array<unsigned, kBTiles / 4>;
-
   //
   // Data members
   //
@@ -172,14 +169,14 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
       int scales_byte_stride,
       int start_n,
       int end_n)
-      : lane_b_k_offset((lane_idx % 4) * 2),
+      : lane_b_k_offset(mod_power2<4>(lane_idx) * 2),
         lane_b_n_offset(lane_idx / 4),
         n_cnt(end_n - start_n),
         scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, (start_n + lane_b_n_offset))),
         scales_stride(scales_byte_stride / sizeof(ElementT))
   {
     assert(ptr_scales != nullptr);
-    assert(scales_byte_stride > 0 && (scales_byte_stride % 16) == 0);
+    assert(scales_byte_stride > 0 && mod_power2<16>(scales_byte_stride) == 0);
     assert(scales_stride >= end_n);
   }
 
@@ -231,10 +228,12 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
   /// Dequantize a block of (16, WarpShape::kN) packed int4 weights to 16b float.
   /// This block has (WarpShape::kN / 8) * 2 tiles, each tile has 2 elements per thread,
   /// thus the FragmentB has (WarpShape::kN / 8) * 2 * 2 elements.
+
+  template <int PackedBSize>
   CUTLASS_DEVICE
   void dequant_k16(
       const int k_offset,
-      FragmentPackedB const &frag_pack_b,
+      cutlass::Array<unsigned, PackedBSize> const &frag_pack_b,
       FragmentScales const &frag_scales,
       FragmentScales const &frag_addon,
       FragmentB &frag_b) const {
@@ -247,12 +246,17 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
     }
 #endif
 
+    // Each 32b number in packed B represent a 16x16 tile
+    constexpr int kPackedBNTiles = WarpShape::kN / 16;
+    constexpr int kPackedBKStride = PackedBSize / kPackedBNTiles;
+    static_assert(kPackedBKStride * kPackedBNTiles == PackedBSize);
+
     // We are processing 16xWarpShape::kN weights at a time, assuming each column has
     // only one scale/offset, so the block size cannot be smaller than 16.
     static_assert(QuantBlocking::kRow >= 16);
 
     const int meta_k = k_offset / QuantBlocking::kRow;
-    int b_idx = (k_offset >> 4) * (WarpShape::kN / 16);
+    int b_idx = mod_power2<kPackedBKStride>(k_offset >> 4) * kPackedBNTiles;
     half2* fb_pair = reinterpret_cast<half2*>(frag_b.data());
     half const* scales = reinterpret_cast<half const*>(frag_scales.data() + meta_k * kMetaFragSize);
     half const* addon = reinterpret_cast<half const*>(frag_addon.data() + meta_k * kMetaFragSize);
@@ -337,9 +341,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   using FragmentScales = cutlass::Array<ElementT, kMetaFragSize * kMetaChunkCount>;
   // using FragmentOffsets = cutlass::Array<uint8_t, kMetaFragSize * kMetaChunkCount>;
 
-  static constexpr int kBTiles = (WarpShape::kK / 8) * (WarpShape::kN / 8);
-  using FragmentPackedB = cutlass::Array<unsigned, kBTiles / 4>;
-
   //
   // Data members
   //
@@ -367,14 +368,14 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
       int scales_byte_stride,
       int start_n,
       int end_n)
-      : lane_b_k_offset((lane_idx % 4) * 2),
+      : lane_b_k_offset(mod_power2<4>(lane_idx) * 2),
         lane_b_n_offset(lane_idx / 4),
         n_cnt(div_up(end_n - start_n, QuantBlocking::kColumn)),
         scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, (start_n + lane_b_n_offset) / QuantBlocking::kColumn)),
         scales_stride(scales_byte_stride / sizeof(ElementT))
   {
     assert(ptr_scales != nullptr);
-    assert(scales_byte_stride > 0 && (scales_byte_stride % 16) == 0);
+    assert(scales_byte_stride > 0 && mod_power2<16>(scales_byte_stride) == 0);
   }
 
   /// Loads [start_k, end_k) x [start_n, end_n) scales from global memory to fragment
@@ -399,7 +400,7 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
     const int meta_k = start_k + lane_b_k_offset * 2;
     const ElementT* scales_ptr = scales_p + meta_k;
     const int k_loads = (end_k - start_k) / 16;
-    if ((end_k - start_k) % 16 != 0) {
+    if (mod_power2<16>(end_k - start_k) != 0) {
       if (lane_b_k_offset == 0 && lane_b_n_offset == 0) {
         printf("k-dimension must be multiple of 16\n");
       }
@@ -450,10 +451,11 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   /// Dequantize a block of (16, WarpShape::kN) packed int4 weights to 16b float.
   /// This block has (WarpShape::kN / 8) * 2 tiles, each tile has 2 elements per thread,
   /// thus the FragmentB has (WarpShape::kN / 8) * 2 * 2 elements.
+  template<int PackedBSize>
   CUTLASS_DEVICE
   void dequant_k16(
       const int k_offset,
-      FragmentPackedB const &frag_pack_b,
+      cutlass::Array<unsigned, PackedBSize> const &frag_pack_b,
       FragmentScales const &frag_scales,
       FragmentScales const &frag_addon,
       FragmentB &frag_b) const {
@@ -466,15 +468,20 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
     }
   #endif
 
+    // Each 32b number in packed B represent a 16x16 tile
+    constexpr int kPackedBNTiles = WarpShape::kN / 16;
+    constexpr int kPackedBKStride = PackedBSize / kPackedBNTiles;
+    static_assert(kPackedBKStride * kPackedBNTiles == PackedBSize);
+
     // Row-wise quantization, every row has its own scale/offset
-    int b_idx = (k_offset >> 4) * (WarpShape::kN / 16);
+    int b_idx = mod_power2<kPackedBKStride>(k_offset >> 4) * kPackedBNTiles;
     half2* fb_pair = reinterpret_cast<half2*>(frag_b.data());
     half2 const* scale_pair = nullptr;
     half2 const* addon_pair = nullptr;
 
     CUTLASS_PRAGMA_UNROLL
     for (int nn = 0; nn < WarpShape::kN; nn += 16, ++b_idx, fb_pair += 4) {
-      if (nn % QuantBlocking::kColumn == 0) {
+      if (mod_power2<QuantBlocking::kColumn>(nn) == 0) {
         int meta_n = nn / QuantBlocking::kColumn;
         scale_pair = reinterpret_cast<half2 const*>(frag_scales.data() + (meta_n * kMetaFragSize + k_offset / 4)); // k_offset / 16 * 4
         addon_pair = reinterpret_cast<half2 const*>(frag_addon.data() + (meta_n * kMetaFragSize + k_offset / 4)); // k_offset / 16 * 4

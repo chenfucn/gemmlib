@@ -27,4 +27,11 @@ constexpr int round_up(int a, int b) {
   return div_up(a, b) * b;
 }
 
+template <int N>
+CUTLASS_HOST_DEVICE
+constexpr int mod_power2(int a) {
+  static_assert((N & (N - 1)) == 0, "To use mod_power2<N>, N must be a power of 2.");
+  return a & (N - 1);
+}
+
 }  // namespace mickey

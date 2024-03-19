@@ -14,6 +14,7 @@
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/memory.h"
 
+#include "int_util.h"
 
 namespace mickey {
 namespace gemm {
@@ -155,7 +156,7 @@ class TensorCoreTileLoader {
     ///   T14, T30
     ///   T15, T31
 
-    int mn_lane_id = lane_id % kMNThreads;
+    int mn_lane_id = mod_power2<kMNThreads>(lane_id);
     int k_lane_id = lane_id / kMNThreads;
     if (mn_lane_id < mn_cnt_ && k_lane_id < k16_cnt_) {
       g_ptr_ = byte_ptr + mn_lane_id * byte_stride + k_lane_id * 16;
@@ -215,7 +216,7 @@ class TensorCoreTileLoader {
         return;
       }
     }
-    assert(mn_offset > 0 && (mn_offset % kMNStride) == 0);
+    assert(mn_offset > 0 && mod_power2<kMNStride>(mn_offset) == 0);
     cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
         smem_lane_ptr, g_ptr_ + mn_offset * stride_, g_ptr_ != nullptr && mn_offset < mn_cnt_);
   }
@@ -252,6 +253,20 @@ class TensorCoreTileLoader {
   CUTLASS_DEVICE
   static void ldmatrix_sync(cutlass::Array<unsigned, kTiles>& frag, void const* smem_lane_ptr) {
     cutlass::arch::ldsm<cutlass::layout::RowMajor, kTiles>(frag, smem_lane_ptr);
+  }
+
+  template<typename T1, typename T2, int Loads, int Size = (kTiles * sizeof(unsigned) * Loads) / sizeof(T1)>
+  CUTLASS_DEVICE
+  static void multi_ldmatrix_sync(cutlass::Array<T1, Size>& fragment, T2 const* &smem_lane_ptr) {
+    static_assert(sizeof(unsigned) * kTiles * Loads == sizeof(T1) * Size, "Fragment size mismatch");
+    cutlass::Array<unsigned, kTiles>* ptr =
+        reinterpret_cast<cutlass::Array<unsigned, kTiles>*>(fragment.data());
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int m_load = 0; m_load < Loads; ++m_load, ++ptr) {
+      ldmatrix_sync(*ptr, smem_lane_ptr);
+      smem_lane_ptr += kByteSize / sizeof(T2);
+    }
   }
 
 };

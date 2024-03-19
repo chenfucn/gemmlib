@@ -19,7 +19,6 @@
 
 #include "gemm/warp/tensor_core_tile_loader.h"
 #include "gemm/warp/quantb_meta_loader.h"
-
 #include "int_util.h"
 
 namespace mickey {
@@ -150,11 +149,10 @@ struct QuantB4Gemm {
     WarpSmemT smem[kWarps];
   };
 
-  // Fragments of quantized weights, keep entire warp tile in registers to maximize
-  // the reuse of shared scale/offsets
+  // Fragments of quantized weights
   using FragmentPackedB = cutlass::Array<
       unsigned,  // 8 of int4 weights each tile (becomes 4 tiles when de-quantized)
-      PackedBLoader::kTiles * kB_Nloads * kB_Kloads>;
+      PackedBLoader::kTiles * kB_Nloads /* * kB_Kloads */>;
 
   // Fragments for operand A and dequantized B, each tile has 2 elements per thread.
   // In each main loop iteration, we use a (WarpShape::kM, 16) block of A and
@@ -341,8 +339,9 @@ struct QuantB4Gemm {
     return cutlass::Status::kSuccess;
   }
 
+  template<typename PackedBType, typename AType>
   CUTLASS_DEVICE
-  static void advance_stage(int &stage, uint8_t* &packed_b_smem_ptr, ElementT* &a_smem_ptr) {
+  static void advance_stage(int &stage, PackedBType* &packed_b_smem_ptr, AType* &a_smem_ptr) {
     if (stage == kStages - 1) {
       packed_b_smem_ptr -= kStages * MainLoopSharedBuffer::kPackedBSizePerIter;
       a_smem_ptr -= kStages * MainLoopSharedBuffer::kASizePerIter;
@@ -392,17 +391,6 @@ struct QuantB4Gemm {
     assert(assert_pass);
 #endif
 
-    // Local fragments hopefully allocated in registers
-    FragmentPackedB fragment_packed_b;
-    typename MetaLoader::FragmentScales fragment_scales[kStages];
-    FragmentB fragment_b;
-    FragmentA fragment_a;
-  
-    typename MmaOp::FragmentC accumulators;
-    accumulators.clear();
-  
-    MmaOp mma_op;
-
     //
     // for gemm input B size (k,n), packed b is (k/2,n/2), element size 2, column major.
     // so lead dimension byte size is coincidentally k/2 * 2 = k
@@ -448,6 +436,10 @@ struct QuantB4Gemm {
       }
     }
 
+    //
+    // Prologue: start loading from global memory to shared memory
+    //
+
     int load_k = k_start; // current k index for loading from global memory to shared memory
     int smem_write_stage = 0;
     uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.smem[warp_idx].main_loop.shared_B.data());
@@ -456,9 +448,13 @@ struct QuantB4Gemm {
     uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr;
     ElementT* a_smem_write_ptr = a_shared_ptr;
 
-    //
-    // Prologue
-    //
+    // For quantization meta data, we skip the cp.async -> ldmatrix route, and use direct
+    // load from HBM to register. For the following reasons:
+    // 1. Can't find a way to utilize ldmatrix effectively. Using cp.async and then load
+    //    seems to increase the number of instructions needed.
+    // 2. Save a little shared memory space.
+    typename MetaLoader::FragmentScales fragment_scales[kStages];
+
     CUTLASS_PRAGMA_UNROLL
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
       meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
@@ -483,6 +479,21 @@ struct QuantB4Gemm {
       cutlass::arch::cp_async_fence();
     }    
 
+    // Prepare for the main loop, declare fragments and accumulators,
+    // hopefully allocated in registers
+    FragmentPackedB fragment_packed_b;
+    FragmentB fragment_b;
+    FragmentA fragment_a;
+    typename MmaOp::FragmentC accumulators;
+    accumulators.clear();
+
+    // To speedup de-quantization, instead of using f = s * (q - z),
+    // we use f = s * q + (s * -z) to take advantage of the fma
+    // instruction. This is the storage of (s * -z)
+    typename MetaLoader::FragmentScales fragment_addon;
+  
+    MmaOp mma_op;
+
     // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
     cutlass::arch::cp_async_wait<kStages - 2>();
     //__syncthreads(); is this necessary since the loader is warp based?
@@ -501,22 +512,21 @@ struct QuantB4Gemm {
       }
     }
 
-    int smem_read_stage = 0;
-    uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr;
-    ElementT* a_smem_read_ptr = a_shared_ptr;
-
     //
     // Mainloop
     //
+  
+    int smem_read_stage = 0;
+    uint8_t const* packed_b_smem_read_ptr = packed_b_shared_ptr;
+    ElementT const* a_smem_read_ptr = a_shared_ptr;
+
+    // Prefix of the main loop. Preload the double buffer in registers
+
+    meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
+    meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
+
     CUTLASS_PRAGMA_UNROLL
     for (int proc_k = k_start; proc_k < k_end; proc_k += WarpShape::kK){
-      typename MetaLoader::FragmentScales fragment_addon;
-  
-      meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
-      cutlass::Array<unsigned, PackedBLoader::kTiles>* packed_b_tile_frag_ptr =
-          reinterpret_cast<cutlass::Array<unsigned, PackedBLoader::kTiles>*>(fragment_packed_b.data());
-
-      meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
 
       // If PackedBLoader::kKStride > 16, then kNLoads must be 1. Because we don't want a
       // over-complicated tile visiting pattern. We always want to visit the all the
@@ -528,18 +538,8 @@ struct QuantB4Gemm {
       CUTLASS_PRAGMA_UNROLL
       for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
         // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
-        if ((warp_k_offset % PackedBLoader::kKStride) == 0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int n_load = 0; n_load < kB_Nloads; ++n_load, ++packed_b_tile_frag_ptr) {
-            PackedBLoader::ldmatrix_sync(*packed_b_tile_frag_ptr, packed_b_smem_read_ptr);
-            packed_b_smem_read_ptr += PackedBLoader::kByteSize;
-
-            if constexpr (kDebugPrintB) {
-              uint8_t const* ptr = reinterpret_cast<uint8_t const*>(packed_b_tile_frag_ptr->data());
-              printf("Warp: %d, lane %2d, smem_read_ptr %p, %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d\n",
-                warp_idx, lane_idx, packed_b_smem_read_ptr, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
-            }
-          }
+        if (mod_power2<PackedBLoader::kKStride>(warp_k_offset) == 0) {
+          PackedBLoader::template multi_ldmatrix_sync<uint32_t, uint8_t, kB_Nloads>(fragment_packed_b, packed_b_smem_read_ptr);
 
           packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
           packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
@@ -547,15 +547,7 @@ struct QuantB4Gemm {
           load_k += PackedBLoader::kKStride;
         }
 
-        static_assert(ATileLoader::kTiles * sizeof(unsigned) * kA_Mloads == FragmentA::kElements * sizeof(ElementT));
-        cutlass::Array<unsigned, ATileLoader::kTiles>* a_tile_frag_ptr =
-            reinterpret_cast<cutlass::Array<unsigned, ATileLoader::kTiles>*>(fragment_a.data());
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int m_load = 0; m_load < kA_Mloads; ++m_load, ++a_tile_frag_ptr) {
-          ATileLoader::ldmatrix_sync(*a_tile_frag_ptr, a_smem_read_ptr);
-          a_smem_read_ptr += ATileLoader::kByteSize / kElementSize;
-        }
+        ATileLoader::template multi_ldmatrix_sync<ElementT, ElementT, kA_Mloads>(fragment_a, a_smem_read_ptr);
 
         a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_write_ptr);
         a_smem_write_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
@@ -588,6 +580,9 @@ struct QuantB4Gemm {
 
       advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr);
       advance_stage(smem_read_stage, packed_b_smem_read_ptr, a_smem_read_ptr);
+
+      meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
+      meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
 
       // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
       cutlass::arch::cp_async_wait<kStages - 2>();
