@@ -84,13 +84,16 @@ struct QuantB4Gemm {
     "Weight B is packed as 16x16 tiles, warp shape must contain whole tiles!");
 
   // Need to explore the way to relax this for very small m value.
-  static_assert(WarpShape::kM % 16 == 0,
-      "Stride M smaller than mma instruction shape is not yet supported!");
+  static_assert((WarpShape::kM % InstructionShape::kM == 0)
+                 && (WarpShape::kN % InstructionShape::kN == 0)
+                 && (WarpShape::kK % InstructionShape::kK == 0),
+                "Warp shape must be multiple of instruction shape!");
 
   /// switches for debug print
   static constexpr bool kDebugPrintB = false;
-  static constexpr bool kDebugPrintFragA = false;
+  static constexpr bool kDebugPrintA = false;
   static constexpr bool kDebugPrintC = false;
+  static constexpr bool kDebugPrintSteps = false;
 
   using WarpPackedBShape = cutlass::gemm::GemmShape<1, WarpShape::kN/2, WarpShape::kK>;
   static constexpr int kNTilesPerLoad = std::min(4, WarpPackedBShape::kN / 8);
@@ -429,13 +432,6 @@ struct QuantB4Gemm {
       k_start * kElementSize, k_end * kElementSize, // need to convert to byte based index
       lane_idx};
 
-    if constexpr (kDebugPrintB || kDebugPrintFragA || kDebugPrintC) {
-      if (lane_idx == 0) {
-        printf("Warp: %d, m_start %d, m_end %d, n_start %d, n_end %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
-          warp_idx, m_start, m_end, n_start, n_end, k_start, k_end, packed_n_start, packed_n_end);
-      }
-    }
-
     //
     // Prologue: start loading from global memory to shared memory
     //
@@ -444,6 +440,13 @@ struct QuantB4Gemm {
     int smem_write_stage = 0;
     uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.smem[warp_idx].main_loop.shared_B.data());
     ElementT* a_shared_ptr = a_tile_loader.get_smem_lane_ptr(shared_storage.smem[warp_idx].main_loop.shared_A.data());
+
+    if constexpr (kDebugPrintSteps) {
+      if (lane_idx == 0) {
+        printf("Warp: %d, m_start %d, m_end %d, n_start %d, n_end %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n    PackedB: %p, A: %p\n",
+          warp_idx, m_start, m_end, n_start, n_end, k_start, k_end, packed_n_start, packed_n_end, packed_b_shared_ptr, a_shared_ptr);
+      }
+    }
 
     uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr;
     ElementT* a_smem_write_ptr = a_shared_ptr;
@@ -481,23 +484,18 @@ struct QuantB4Gemm {
 
     // Prepare for the main loop, declare fragments and accumulators,
     // hopefully allocated in registers
-    FragmentPackedB fragment_packed_b;
+    FragmentPackedB fragment_packed_b[2];
     FragmentB fragment_b;
-    FragmentA fragment_a;
+    FragmentA fragment_a[2];
     typename MmaOp::FragmentC accumulators;
     accumulators.clear();
-
-    // To speedup de-quantization, instead of using f = s * (q - z),
-    // we use f = s * q + (s * -z) to take advantage of the fma
-    // instruction. This is the storage of (s * -z)
-    typename MetaLoader::FragmentScales fragment_addon;
   
     MmaOp mma_op;
 
     // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
     cutlass::arch::cp_async_wait<kStages - 2>();
     //__syncthreads(); is this necessary since the loader is warp based?
-    if constexpr(kDebugPrintB) {
+    if constexpr(kDebugPrintA) {
       if (lane_idx == 0) {
         printf("Prologue, warp: %d, WarpPtr: %p\n",
           warp_idx, a_shared_ptr);
@@ -519,15 +517,41 @@ struct QuantB4Gemm {
     int smem_read_stage = 0;
     uint8_t const* packed_b_smem_read_ptr = packed_b_shared_ptr;
     ElementT const* a_smem_read_ptr = a_shared_ptr;
+    typename MetaLoader::FragmentScales scales_read;
+
+    // double buffer indices
+    int packed_b_write_didx = 0;
+    int packed_b_read_didx = 1;
+    int a_didx = 0;
+
+    if constexpr (kDebugPrintSteps) {
+      if (lane_idx == 0) {
+        printf("Prefix: PackedB[%d] <- %p <- %p,  A[%d] <- %p <- %p,  fragment_scales[%d] <- load_k %d\n",
+          packed_b_write_didx, packed_b_smem_read_ptr, packed_b_smem_write_ptr, a_didx, a_smem_read_ptr, a_smem_write_ptr, smem_write_stage, load_k);
+      }
+    }
 
     // Prefix of the main loop. Preload the double buffer in registers
-
     meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
-    meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
+
+    PackedBLoader::template multi_ldmatrix_sync<uint32_t, uint8_t, kB_Nloads>(fragment_packed_b[packed_b_write_didx], packed_b_smem_read_ptr);
+    packed_b_write_didx ^= 1;
+
+    packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
+    packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
+    ++packed_b_loader;
+
+    ATileLoader::template multi_ldmatrix_sync<ElementT, ElementT, kA_Mloads>(fragment_a[a_didx], a_smem_read_ptr);
+    a_didx ^= 1;
+
+    a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_write_ptr);
+    a_smem_write_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
+    ++a_tile_loader;
+
+    // proc_k + (kStages - 1) * WarpShape::kK  = load_k
 
     CUTLASS_PRAGMA_UNROLL
-    for (int proc_k = k_start; proc_k < k_end; proc_k += WarpShape::kK){
-
+    while (load_k < k_end + (kStages - 1) * WarpShape::kK){
       // If PackedBLoader::kKStride > 16, then kNLoads must be 1. Because we don't want a
       // over-complicated tile visiting pattern. We always want to visit the all the
       // packed B tiles on the N dimension in a contiguous manner, and then move to the next
@@ -537,29 +561,60 @@ struct QuantB4Gemm {
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
       for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
-        // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
+        // To speedup de-quantization, instead of using f = s * (q - z),
+        // we use f = s * q + (s * -z) to take advantage of the fma
+        // instruction. This is the storage of (s * -z)
+        typename MetaLoader::FragmentScales fragment_addon;
+
+        if (warp_k_offset == 0) {
+          scales_read = fragment_scales[smem_read_stage];
+          meta_loader.process(scales_read, fragment_addon);
+          if constexpr (kDebugPrintSteps){
+            if (lane_idx == 0) {
+              printf("fragment_scales[%d] <== READ\n", smem_read_stage);
+            }
+          }
+        }
+
+        const int next_k_offset = mod_power2<WarpShape::kK>(warp_k_offset + InstructionShape::kK);
         if (mod_power2<PackedBLoader::kKStride>(warp_k_offset) == 0) {
-          PackedBLoader::template multi_ldmatrix_sync<uint32_t, uint8_t, kB_Nloads>(fragment_packed_b, packed_b_smem_read_ptr);
+          packed_b_read_didx ^= 1;
+        }
+
+        // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
+        if (mod_power2<PackedBLoader::kKStride>(next_k_offset) == 0) {
+          if constexpr (kDebugPrintSteps) {
+            if (lane_idx == 0) {
+              printf("PackedB[%d] <- %p <- %p\n", packed_b_write_didx, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
+            }
+          }
+          PackedBLoader::template multi_ldmatrix_sync<uint32_t, uint8_t, kB_Nloads>(fragment_packed_b[packed_b_write_didx], packed_b_smem_read_ptr);
+          packed_b_write_didx ^= 1;
 
           packed_b_loader.load_lateral_n<kB_Nloads>(packed_b_smem_write_ptr);
           packed_b_smem_write_ptr += PackedBLoader::kByteSize * kB_Nloads;
           ++packed_b_loader;
-          load_k += PackedBLoader::kKStride;
         }
 
-        ATileLoader::template multi_ldmatrix_sync<ElementT, ElementT, kA_Mloads>(fragment_a, a_smem_read_ptr);
+        if constexpr (kDebugPrintSteps) {
+          if (lane_idx == 0) {
+            printf("A[%d] <- %p <- %p\n",  a_didx, a_smem_read_ptr, a_smem_write_ptr);
+          }
+        }
+        ATileLoader::template multi_ldmatrix_sync<ElementT, ElementT, kA_Mloads>(fragment_a[a_didx], a_smem_read_ptr);
+        a_didx ^= 1;
 
         a_tile_loader.load_lateral_n<kA_Mloads>(a_smem_write_ptr);
         a_smem_write_ptr += ATileLoader::kByteSize * kA_Mloads / kElementSize;
         ++a_tile_loader;
 
-        if constexpr (kDebugPrintFragA) {
+        if constexpr (kDebugPrintA) {
           const int lane_id = threadIdx.x % 32;
           if (lane_id == 0) {
             printf("====  A tiles =======\n");
           }
           const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          const ElementT* a_ptr = fragment_a.data();
+          const ElementT* a_ptr = fragment_a[a_didx].data();
           for (int m2_tile = 0; m2_tile < (WarpShape::kM / InstructionShape::kM); ++m2_tile, a_ptr += 8) {
             printf(format, float(a_ptr[0]), float(a_ptr[1]));
             printf(format, float(a_ptr[2]), float(a_ptr[3]));
@@ -568,34 +623,46 @@ struct QuantB4Gemm {
           }
         }
 
+        if constexpr (kDebugPrintSteps) {
+          if (lane_idx == 0) {
+            printf("Mma(PackedB[%d], A[%d])\n", packed_b_read_didx, a_didx);
+          }
+        }
+
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales[smem_read_stage], fragment_addon, fragment_b);
+        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b[packed_b_read_didx], scales_read, fragment_addon, fragment_b);
 
         // GEMM operation, covering a shape of (WarpShape::kM, WarpShape::kN, InstructionShape::kK)
-        mma_op(accumulators, fragment_a, fragment_b, accumulators);
-      }
+        mma_op(accumulators, fragment_a[a_didx], fragment_b, accumulators);
 
-      // Defines the boundary of a stage of cp.async.
-      cutlass::arch::cp_async_fence();
+        if (next_k_offset + InstructionShape::kK == WarpShape::kK) {
+          // Next stage of the main loop
+          cutlass::arch::cp_async_fence();
+          advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr);
+          advance_stage(smem_read_stage, packed_b_smem_read_ptr, a_smem_read_ptr);
 
-      advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr);
-      advance_stage(smem_read_stage, packed_b_smem_read_ptr, a_smem_read_ptr);
+          // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
+          cutlass::arch::cp_async_wait<kStages - 2>();
+          //__syncthreads(); is this necessary since the loader is warp based?
 
-      meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
-      meta_loader.process(fragment_scales[smem_read_stage], fragment_addon);
+          load_k += WarpShape::kK;
+          if constexpr (kDebugPrintSteps) {
+            if (lane_idx == 0) {
+              printf("fragment_scales[%d] <- load_k %d\n", smem_write_stage, load_k);
+            }
+          }
+          meta_loader.load(fragment_scales[smem_write_stage], load_k, min(k_end, load_k + WarpShape::kK));
 
-      // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
-      cutlass::arch::cp_async_wait<kStages - 2>();
-      //__syncthreads(); is this necessary since the loader is warp based?
-
-      if constexpr(kDebugPrintB) {
-        if (lane_idx == 0) {
-          printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
-            warp_idx, proc_k, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
+          if constexpr(kDebugPrintB) {
+            if (lane_idx == 0) {
+              printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
+                warp_idx, load_k - (kStages - 1) * WarpShape::kK, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
+            }
+            cutlass::debug::dump_shmem(packed_b_shared_ptr, MainLoopSharedBuffer::kPackedBSize);
+          }
         }
-        cutlass::debug::dump_shmem(packed_b_shared_ptr, MainLoopSharedBuffer::kPackedBSize);
-      }
-    }
+      }  // next k block (stride = 16)
+    }  // Main loop: next stage
 
     if constexpr (kDebugPrintC) {
       static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
