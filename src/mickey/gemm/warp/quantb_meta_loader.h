@@ -91,6 +91,14 @@ void compute_addon(cutlass::Array<cutlass::half_t, N> const &frag_scales,
   }
 }
 
+template <int LoadsPerWarp>
+CUTLASS_DEVICE
+static int compute_lane_loads(int lane_idx){
+    return (LoadsPerWarp % 32) > lane_idx
+           ? (LoadsPerWarp / 32 + 1)
+           : (LoadsPerWarp / 32);
+}
+
 }  // namespace detail
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -118,7 +126,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
   using WarpShape = WarpShape_;
   using ElementT = ElementT_;
 
-  static_assert((QuantBlocking::kColumn == 1));
   static_assert((WarpShape::kN % 16) == 0 && (WarpShape::kK % 16) == 0,
                 "Warp tile size must be multiple of 16x16, the unit of packed weights.");
   static_assert(sizeof(ElementT) == 2, "Quantization only supports 16-bit float types");
@@ -139,6 +146,10 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
   static constexpr int kMetaFragSize = WarpShape::kN / 8;
   static constexpr int kMetaChunkCount = div_up(WarpShape::kK, QuantBlocking::kRow);
 
+  // HBM -> SMEM, 16 bytes per load, no leftover since WarpShape::kN is multiple of 16
+  static constexpr int kSmemSize = WarpShape::kN * kMetaChunkCount;
+  static constexpr int kScaleLoadsPerWarp = (kSmemSize * sizeof(ElementT)) / 16;
+
   using FragmentScales = cutlass::Array<ElementT, kMetaFragSize * kMetaChunkCount>;
   // using FragmentOffsets = cutlass::Array<uint8_t, kMetaFragSize * kMetaChunkCount>;
 
@@ -151,6 +162,8 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
 
   const ElementT * const scales_p;
   const int scales_stride;
+
+  const int scales_ld_cnt;
 
   //
   // Methods
@@ -170,10 +183,11 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
       int start_n,
       int end_n)
       : lane_b_k_offset(mod_power2<4>(lane_idx) * 2),
-        lane_b_n_offset(lane_idx / 4),
+        lane_b_n_offset(div_power2<4>(lane_idx)),
         n_cnt(end_n - start_n),
-        scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, (start_n + lane_b_n_offset))),
-        scales_stride(scales_byte_stride / sizeof(ElementT))
+        scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, start_n)),
+        scales_stride(div_power2<sizeof(ElementT)>(scales_byte_stride)),
+        scales_ld_cnt(detail::compute_lane_loads<kScaleLoadsPerWarp>(lane_idx))
   {
     assert(ptr_scales != nullptr);
     assert(scales_byte_stride > 0 && mod_power2<16>(scales_byte_stride) == 0);
@@ -183,29 +197,47 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
   /// Loads [start_k, end_k) x [start_n, end_n) scales from global memory to fragment
   /// [start_n, end_n) was specified in the constructor
   CUTLASS_DEVICE
-  void load(FragmentScales &frag_scales, int start_k, int end_k) const {
+  void load_to_smem(int start_k, int end_k, ElementT* smem) const {
+    constexpr int load_stride = (32 * 16 / sizeof(ElementT));
+    const int lane_idx = threadIdx.x % 32;
+    int lane_ptr_offset = lane_idx * (16 / sizeof(ElementT));
+
     if (end_k <= start_k) {
+      if (end_k + WarpShape::kK <= start_k) {
+        return;
+      }
+      // Zero out the smem
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
+        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
+            smem + lane_ptr_offset, nullptr, false);
+      }
       return;
     }
 
     // Column-wise quantization, every column has its own scale/offset
-    const int meta_k = (start_k + lane_b_k_offset) / QuantBlocking::kRow;
-    const ElementT* scales_ptr = scales_p + meta_k * scales_stride;;
+    const ElementT* scales_ptr = scales_p + (start_k / QuantBlocking::kRow) * scales_stride;
     const int k_loads = div_up(end_k - start_k, QuantBlocking::kRow);
 
+    // Load scales to smem
     CUTLASS_PRAGMA_UNROLL
-    for (int k_blk_idx = 0; k_blk_idx < kMetaChunkCount; ++k_blk_idx) {
-      // k-dimension loop
-      CUTLASS_PRAGMA_UNROLL
-      for (int n_tile_idx = 0; n_tile_idx < (WarpShape::kN / 8); ++n_tile_idx) {
-        // n-dimension loop
-        if ((k_blk_idx < k_loads) && ((n_tile_idx * 8) < n_cnt)) {
-          frag_scales[k_blk_idx * kMetaFragSize + n_tile_idx] = scales_ptr[n_tile_idx * 8];
-        } else {
-          frag_scales[k_blk_idx * kMetaFragSize + n_tile_idx] = ElementT(0);
-        }
-      }
-      scales_ptr += scales_stride;
+    for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
+      int k_idx = lane_ptr_offset / WarpShape::kN;
+      int n_idx = lane_ptr_offset % WarpShape::kN;
+      cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
+          &smem[lane_ptr_offset],
+          &scales_ptr[k_idx * scales_stride + n_idx],
+          k_idx < k_loads && n_idx < n_cnt);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void load_fragment(FragmentScales &frag_scales, const ElementT* smem) const {
+    const ElementT* scales_ptr = smem + lane_b_n_offset;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kSmemSize / 8; ++i) {
+      frag_scales[i] = scales_ptr[i << 3];
     }
   }
 
@@ -322,7 +354,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   using WarpShape = WarpShape_;
   using ElementT = ElementT_;
 
-  static_assert(QuantBlocking::kRow == 1);
   static_assert((WarpShape::kN % 16) == 0 && (WarpShape::kK % 16) == 0,
                 "Warp tile size must be multiple of 16x16, the unit of packed weights.");
   static_assert(sizeof(ElementT) == 2, "Quantization only supports 16-bit float types");
@@ -338,6 +369,10 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   static constexpr int kMetaFragSize = (WarpShape::kK / 8) * 2;  // row wise quant, every row has its own scale/offset
   static constexpr int kMetaChunkCount = div_up(WarpShape::kN, QuantBlocking::kColumn);
 
+  // HBM -> SMEM, 16 bytes per load, no leftover since WarpShape::kN is multiple of 16
+  static constexpr int kSmemSize = WarpShape::kK * kMetaChunkCount;
+  static constexpr int kScaleLoadsPerWarp = (kSmemSize * sizeof(ElementT)) / 16;
+
   using FragmentScales = cutlass::Array<ElementT, kMetaFragSize * kMetaChunkCount>;
   // using FragmentOffsets = cutlass::Array<uint8_t, kMetaFragSize * kMetaChunkCount>;
 
@@ -351,6 +386,8 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   const ElementT * const scales_p;
   const int scales_stride;
 
+  const int scales_ld_cnt;
+
   //
   // Methods
   //
@@ -358,6 +395,13 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   static const ElementT* get_scales_p(const void* ptr_scales, int scales_byte_stride, int k, int n) {
     return reinterpret_cast<ElementT const*>(
         reinterpret_cast<uint8_t const*>(ptr_scales) + n * scales_byte_stride + k * sizeof(ElementT));
+  }
+
+  CUTLASS_DEVICE
+  static void copy_4_scales(const ElementT* src, ElementT* dst) {
+    const uint64_t* src64 = reinterpret_cast<const uint64_t*>(src);
+    uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst);
+    dst64[0] = src64[0];
   }
 
   /// Initializes the scale loader, pointing to the start of the scales tensor
@@ -368,11 +412,12 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
       int scales_byte_stride,
       int start_n,
       int end_n)
-      : lane_b_k_offset(mod_power2<4>(lane_idx) * 2),
-        lane_b_n_offset(lane_idx / 4),
+      : lane_b_k_offset(mod_power2<4>(lane_idx) << 1),
+        lane_b_n_offset(div_power2<4>(lane_idx)),
         n_cnt(div_up(end_n - start_n, QuantBlocking::kColumn)),
-        scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, (start_n + lane_b_n_offset) / QuantBlocking::kColumn)),
-        scales_stride(scales_byte_stride / sizeof(ElementT))
+        scales_p(get_scales_p(ptr_scales, scales_byte_stride, 0, start_n / QuantBlocking::kColumn)),
+        scales_stride(scales_byte_stride / sizeof(ElementT)),
+        scales_ld_cnt(detail::compute_lane_loads<kScaleLoadsPerWarp>(lane_idx))
   {
     assert(ptr_scales != nullptr);
     assert(scales_byte_stride > 0 && mod_power2<16>(scales_byte_stride) == 0);
@@ -381,12 +426,41 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
   /// Loads [start_k, end_k) x [start_n, end_n) scales from global memory to fragment
   /// [start_n, end_n) was specified in the constructor
   CUTLASS_DEVICE
-  void load(FragmentScales &frag_scales, int start_k, int end_k) const {
+  void load_to_smem(int start_k, int end_k, ElementT* smem) const {
     assert(scales_stride >= end_k);
+    constexpr int load_stride = (32 * 16 / sizeof(ElementT));
+    const int lane_idx = threadIdx.x % 32;
+    int lane_ptr_offset = lane_idx * (16 / sizeof(ElementT));
+
     if (end_k <= start_k) {
+      if (end_k + WarpShape::kK <= start_k) {
+        return;
+      }
+      // Zero out the smem
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
+        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
+            smem + lane_ptr_offset, nullptr, false);
+      }
       return;
     }
 
+    const ElementT* scales_ptr = scales_p + start_k;
+    const int k_cnt = end_k - start_k;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
+      int k_idx = lane_ptr_offset % WarpShape::kK;
+      int n_idx = lane_ptr_offset / WarpShape::kK;
+      cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
+          &smem[lane_ptr_offset],
+          &scales_ptr[n_idx * scales_stride + k_idx],
+          k_idx < k_cnt && n_idx < n_cnt);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void load_fragment(FragmentScales &frag_scales, const ElementT* smem) const {
     // Row-wise quantization, every row has its own scale/offset, elements have been rearraged
     // such that we can load two tile at a time.
     // T0        T0
@@ -397,38 +471,14 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
     // T1        T2
     // T2        T3
     // T3        T3
-    const int meta_k = start_k + lane_b_k_offset * 2;
-    const ElementT* scales_ptr = scales_p + meta_k;
-    const int k_loads = (end_k - start_k) / 16;
-    if (mod_power2<16>(end_k - start_k) != 0) {
-      if (lane_b_k_offset == 0 && lane_b_n_offset == 0) {
-        printf("k-dimension must be multiple of 16\n");
-      }
-      assert(false);
-    }
+    const ElementT* scales_ptr = smem + (lane_b_k_offset * 2);
+    ElementT* frag_scales_ptr = frag_scales.data();
 
     CUTLASS_PRAGMA_UNROLL
-    for (int n_blk_idx = 0; n_blk_idx < kMetaChunkCount; ++n_blk_idx) {
-      // n-dimension loop
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_tile_idx = 0; k_tile_idx < (WarpShape::kK / 16); ++k_tile_idx) {
-        // k-dimension loop
-        static_assert((kMetaFragSize / 4) == (WarpShape::kK / 16));
-        const int dst_idx = n_blk_idx * kMetaFragSize + k_tile_idx * 4;
-        const int src_idx = k_tile_idx * 16;
-        if ((n_blk_idx < n_cnt) && (k_tile_idx < k_loads)) {
-          frag_scales[dst_idx] = scales_ptr[src_idx];
-          frag_scales[dst_idx + 1] = scales_ptr[src_idx + 1];
-          frag_scales[dst_idx + 2] = scales_ptr[src_idx + 2];
-          frag_scales[dst_idx + 3] = scales_ptr[src_idx + 3];
-        } else {
-          frag_scales[dst_idx] = ElementT(0);
-          frag_scales[dst_idx + 1] = ElementT(0);
-          frag_scales[dst_idx + 2] = ElementT(0);
-          frag_scales[dst_idx + 3] = ElementT(0);
-        }
-      }
-      scales_ptr += scales_stride;
+    for (int i = 0; i < FragmentScales::kElements / 4; ++i) {
+      copy_4_scales(scales_ptr, frag_scales_ptr);
+      frag_scales_ptr += 4;
+      scales_ptr += 16;
     }
   }
 
@@ -482,9 +532,10 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
     CUTLASS_PRAGMA_UNROLL
     for (int nn = 0; nn < WarpShape::kN; nn += 16, ++b_idx, fb_pair += 4) {
       if (mod_power2<QuantBlocking::kColumn>(nn) == 0) {
-        int meta_n = nn / QuantBlocking::kColumn;
-        scale_pair = reinterpret_cast<half2 const*>(frag_scales.data() + (meta_n * kMetaFragSize + k_offset / 4)); // k_offset / 16 * 4
-        addon_pair = reinterpret_cast<half2 const*>(frag_addon.data() + (meta_n * kMetaFragSize + k_offset / 4)); // k_offset / 16 * 4
+        const int meta_n = div_power2<QuantBlocking::kColumn>(nn);
+        const int idx = meta_n * kMetaFragSize + (k_offset >> 2);
+        scale_pair = reinterpret_cast<half2 const*>(frag_scales.data() + idx); // k_offset / 16 * 4
+        addon_pair = reinterpret_cast<half2 const*>(frag_addon.data() + idx); // k_offset / 16 * 4
       }
 
       cutlass::Array<ElementT, 8> ws;

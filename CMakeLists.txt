@@ -53,6 +53,10 @@ target_include_directories(ms_blkq4gemm PUBLIC ${INC_PATH})
 set_property(TARGET ms_blkq4gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 
+# cuda scratch pad
+add_executable(cuda_exp ${PROJECT_SOURCE_DIR}/test/cuda_exp.cu)
+target_include_directories(cuda_exp PUBLIC ${INC_PATH})
+
 # Tests
 
 enable_testing()

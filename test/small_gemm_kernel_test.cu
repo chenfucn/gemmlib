@@ -161,7 +161,11 @@ void test_quantb4_gemm(int m, int n, int k) {
 
 #if 0
   // Debug print the weights tensor detail
+  for (int col = 0; col < n; ++col) {
   for (int row = 0; row < k; ++row) {
+  for (int row = 0; row < k; ++row) {
+    for (int col = 0; col < n; ++col) {
+    for (int row = 0; row < k; ++row) {
     for (int col = 0; col < n; ++col) {
       auto weight_pos = cutlass::make_Coord(row/2, col);
       auto meta_pos = cutlass::make_Coord(row / QuantBlocking::kRow, col / QuantBlocking::kColumn);
@@ -290,7 +294,7 @@ TEST(QuantB4Gemm, PackedBTest) {
   test_quantb4_gemm<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
 
   test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
-  test_quantb4_gemm<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 4>(170, 176, 2048 + 32);
+  test_quantb4_gemm<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 2>(170, 176, 2048 + 32);
 }
 
 } // namespace test
