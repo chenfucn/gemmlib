@@ -203,15 +203,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<block_size_, 1>, WarpShape_, Eleme
     int lane_ptr_offset = lane_idx * (16 / sizeof(ElementT));
 
     if (end_k <= start_k) {
-      if (end_k + WarpShape::kK <= start_k) {
-        return;
-      }
-      // Zero out the smem
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
-            smem + lane_ptr_offset, nullptr, false);
-      }
       return;
     }
 
@@ -433,15 +424,6 @@ struct QuantBScaleLoader<cutlass::MatrixShape<1, block_size_>, WarpShape_, Eleme
     int lane_ptr_offset = lane_idx * (16 / sizeof(ElementT));
 
     if (end_k <= start_k) {
-      if (end_k + WarpShape::kK <= start_k) {
-        return;
-      }
-      // Zero out the smem
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < scales_ld_cnt; ++i, lane_ptr_offset += load_stride) {
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
-            smem + lane_ptr_offset, nullptr, false);
-      }
       return;
     }
 
