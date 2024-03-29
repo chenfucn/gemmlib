@@ -53,6 +53,11 @@ target_include_directories(ms_blkq4gemm PUBLIC ${INC_PATH})
 set_property(TARGET ms_blkq4gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 
+# Benchmark
+add_executable(small_blkq4_fp16_gemm_benchmark ${PROJECT_SOURCE_DIR}/bench/small_blkq4_fp16_gemm_benchmark.cu)
+target_include_directories(small_blkq4_fp16_gemm_benchmark PUBLIC ${INC_PATH})
+target_compile_options(small_blkq4_fp16_gemm_benchmark PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>) 
+
 # cuda scratch pad
 add_executable(cuda_exp ${PROJECT_SOURCE_DIR}/test/cuda_exp.cu)
 target_include_directories(cuda_exp PUBLIC ${INC_PATH})
