@@ -18,6 +18,7 @@
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/memory.h"
 
+#include "cute/layout.hpp"
 
 __global__ void test_kernel(int const* input,
                     int* output){
@@ -48,5 +49,15 @@ int main() {
     h_output = d_output;
 
     printf("Output: %d\n", h_output[0]);
+
+    using Swizzled16 = decltype(
+        cute::composition(cute::Swizzle<1,0,3>{}, 
+                          cute::Layout<cute::Shape<cute::_2, cute::_16>,
+                                       cute::Stride<cute::_1, cute::_2>>{}));
+    Swizzled16 swizzled;
+    cute::print_layout(swizzled);
+
+
+
     return 0;
 }

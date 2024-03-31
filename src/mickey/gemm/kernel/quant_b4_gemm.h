@@ -20,7 +20,6 @@
 #include "cutlass/util/debug.h"
 #include "cutlass/util/device_dump.h"
 
-
 #include "gemm/warp/tensor_core_tile_loader.h"
 #include "gemm/warp/quantb_meta_loader.h"
 #include "int_util.h"
