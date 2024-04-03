@@ -85,10 +85,9 @@ struct SwizzleLoaderTestKernel {
         k_start * sizeof(ElementT), k_end * sizeof(ElementT),
         lane_id);
     for (int load_k = k_start; load_k < k_end; load_k += WarpShape::kK) {
-      loader.new_tile_context(shared_storage.storage);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < SwizzleLoader::kGloadSplit; ++i) {
-        loader.load_to_smem_split();
+        loader.load_to_smem_split(lane_id, shared_storage.storage, i);
       }
       ++loader;
 
@@ -109,7 +108,7 @@ struct SwizzleLoaderTestKernel {
       if constexpr(WarpShape::kN == 8 && ((WarpShape::kK * sizeof(ElementT)) == 64)) {
         // it's a 8 x 64 shape, 4 tiles stacked all on the k dimension
         ElementT frag[8 * 64 / sizeof(ElementT)];
-        loader.load_fragment_k64(shared_storage.storage, 0, frag);
+        loader.load_fragment_k64(lane_id, shared_storage.storage, 0, frag);
 
         int byte_stride = params.output_stride_ * sizeof(ElementT);
         unsigned* fragment_b = reinterpret_cast<unsigned*>(frag);
@@ -143,7 +142,7 @@ struct SwizzleLoaderTestKernel {
         for (int k_offset = 0; k_offset < WarpShape::kK; k_offset += k_depth) {
           int proc_k = load_k + k_offset;
           if (proc_k < k_end) {
-            loader.load_fragment_k32(shared_storage.storage, k_offset * sizeof(ElementT), frag);
+            loader.load_fragment_k32(lane_id, shared_storage.storage, k_offset * sizeof(ElementT), frag);
             // if (lane_id == 0)
             //   printf(" ==== k_offset: %d, proc_k %d, k_end %d ====\n", k_offset, proc_k, k_end);
             // printf("%3d, %3d, ", frag[0], frag[1]);
@@ -201,6 +200,10 @@ void test_swizzle_loader(int m, int n, int k) {
   using WarpShape = WarpShape_;
   using ElementT = ElementT_;
   using TestKernel = SwizzleLoaderTestKernel<WarpShape, ElementT>;
+
+  std::cout << "Test swizzle loader WarpShape (";
+  std::cout << WarpShape::kM << ", " << WarpShape::kN << ", " << WarpShape::kK << ") (";
+  std::cout << m << ", " << n << ", " << k << ")" << std::endl;
 
   cutlass::gemm::GemmCoord problem_size(m, n, k);
   cutlass::HostTensor<ElementT_, cutlass::layout::ColumnMajor> tensor_b({k + 16, n});
@@ -271,11 +274,12 @@ TEST(SwizzleLoader, LoadBTest) {
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 32, 32>, uint16_t>(1, 40, 80);
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 64, 32>, uint16_t>(1, 140, 80);
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 8, 32>, uint16_t>(1, 140, 80);
-  test_swizzle_loader<cutlass::gemm::GemmShape<1, 16, 64>, uint16_t>(1, 32 - 5, 64 * 5 - 16);
+  test_swizzle_loader<cutlass::gemm::GemmShape<1, 16, 64>, uint16_t>(1, 16, 64 * 5 - 16);
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 64, 64>, uint16_t>(1, 128 - 5, 64 * 5 + 16);
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 64, 128>, uint8_t>(1, 128 - 5, 64 * 5 + 16);
 
   // test_swizzle_loader<cutlass::gemm::GemmShape<1, 16, 32>, uint8_t>(1, 16, 64);
+
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 32, 32>, uint8_t>(1, 34, 128 + 16);
   test_swizzle_loader<cutlass::gemm::GemmShape<1, 64, 16>, uint16_t>(1, 60, 64 - 8);
 

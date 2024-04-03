@@ -409,7 +409,7 @@ struct LoadPackedBTestKernel {
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
+        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
         CUTLASS_PRAGMA_UNROLL
         for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
           int n = n_start + b_tile_n * 8 + lane_b_n_offset;

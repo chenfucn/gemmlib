@@ -383,7 +383,7 @@ struct SwizzleDequantTestKernel {
       meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scale_smem_ptr);
 
       // Load packed b
-      packed_b_loader.load_to_smem(packed_b_smem_ptr);
+      packed_b_loader.load_to_smem(lane_idx, packed_b_smem_ptr);
       ++packed_b_loader;
       packed_b_smem_ptr += PackedBLoader::kBlockSize;
 
@@ -422,28 +422,26 @@ struct SwizzleDequantTestKernel {
 
       meta_loader.process(fragment_scales, fragment_addon);
 
-      packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
-
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
       for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
         // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
         if ((warp_k_offset % kFragPackedBStrideK) == 0) {
           if constexpr (kFragPackedBStrideK == 32) {
-            packed_b_loader.load_fragment_k32(packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
+            packed_b_loader.load_fragment_k32(lane_idx, packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
           } else {
             static_assert(kFragPackedBStrideK == 32 || kFragPackedBStrideK == 64);
-            packed_b_loader.load_fragment_k64(packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
+            packed_b_loader.load_fragment_k64(lane_idx, packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
           }
         }
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-          packed_b_loader.load_to_smem_split();
+          packed_b_loader.load_to_smem_split(lane_idx, packed_b_smem_write_ptr, i + (warp_k_offset / InstructionShape::kK) * kPackBGloadsPerIter);
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
+        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
         CUTLASS_PRAGMA_UNROLL
         for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
           int n = n_start + b_tile_n * 8 + lane_b_n_offset;

@@ -89,10 +89,10 @@ struct QuantB4Gemm {
   static_assert(kStages > 1, "Number of pipeline stages must be greater than 1.");
   static_assert(kElementSize == 2, "Only support 16b float types.");
 
-  // Quantized weights are packed int4, each 16x16 tile of int4
-  // is packed into 8x8 tile of 16b (i.e. 8x16 tile of bytes)
-  static_assert(WarpShape::kN % 16 == 0 && WarpShape::kK % 16 == 0,
+  static_assert(WarpShape::kN % 16 == 0,
     "Weight B is packed as 16x16 tiles, warp shape must contain whole tiles!");
+  static_assert(WarpShape::kK % 32 == 0,
+    "K stride too small leading to inefficient global memory load!");
 
   // Need to explore the way to relax this for very small m value.
   static_assert((WarpShape::kM % InstructionShape::kM == 0)
@@ -106,6 +106,8 @@ struct QuantB4Gemm {
   static constexpr bool kDebugPrintC = false;
   static constexpr bool kDebugPrintSteps = false;
 
+  using ATileLoader = mickey::gemm::warp::SwizzleTileLoader<WarpShape::kM, WarpShape::kK * kElementSize>;
+  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
   using WarpPackedBShape = cutlass::gemm::GemmShape<1, WarpShape::kN/2, WarpShape::kK>;
   using PackedBLoader = mickey::gemm::warp::SwizzleTileLoader<WarpPackedBShape::kN, WarpPackedBShape::kK>;
 
@@ -142,10 +144,6 @@ struct QuantB4Gemm {
   // to load 4 tiles, fully utilize the ldmatrix instruction.
   static constexpr int kFragPackedBStrideK = WarpPackedBShape::kN == 8 ? 64 : 32;
   static_assert(WarpShape::kK % kFragPackedBStrideK == 0);
-
-  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
-
-  using ATileLoader = mickey::gemm::warp::SwizzleTileLoader<WarpShape::kM, WarpShape::kK * kElementSize>;
 
   static constexpr int kWarps = kSplitK; // TODO! more warps when we have a larger thread block shape
   static int const kThreadCount = 32 * kWarps;
@@ -224,6 +222,13 @@ struct QuantB4Gemm {
       cutlass::gemm::GemmShape<WarpShape::kM, WarpShape::kN, InstructionShape::kK>, ElementT, cutlass::layout::RowMajor, ElementT,
       cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor,
       MmaPolicy>;
+
+  // The main loop iterates on k index. A stage processes
+  // (WarpShape::kM, WarpShape::kN, WarpShape::kK), in it, each
+  // MmaOp processes (WarpShape::kM, WarpShape::kN, InstructionShape::kK)
+  // This value is > 1 since we asserted (WarpShape::kK % 32 == 0) above
+  static constexpr int kMmaIterations = WarpShape::kK / InstructionShape::kK;
+  static constexpr int kMmaIterPerPackedB = kFragPackedBStrideK / InstructionShape::kK;
 
   /// Parameters structure
   struct Params {
@@ -492,12 +497,12 @@ struct QuantB4Gemm {
       scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
       // Load packed b
-      packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
+      packed_b_loader.load_to_smem(lane_idx, packed_b_smem_write_ptr);
       packed_b_smem_write_ptr += PackedBLoader::kBlockSize;
       ++packed_b_loader;
 
       // Load A
-      a_tile_loader.load_to_smem(a_smem_write_ptr);
+      a_tile_loader.load_to_smem(lane_idx, a_smem_write_ptr);
       a_smem_write_ptr += MainLoopSharedBuffer::kASizePerIter;
       ++a_tile_loader;
 
@@ -542,66 +547,59 @@ struct QuantB4Gemm {
     ElementT const* a_smem_read_ptr = a_shared_ptr;
     ElementT const* scales_smem_read_ptr = scales_shared_ptr;
 
-    // double buffer indices
-    int packed_b_write_didx = 0;
-    int packed_b_read_didx = 1;
-    int a_didx = 0;
-    int meta_write_d_idx = 0;
-    int meta_read_d_idx = 1;
-
     if constexpr (kDebugPrintSteps) {
       if (lane_idx == 0) {
         printf("Prefix: PackedB[%d] <- %p <- %p,  A[%d] <- %p <- %p,  fragment_scales[%d] <- load_k %d <- %p <- %p\n",
-          packed_b_write_didx, packed_b_smem_read_ptr, packed_b_smem_write_ptr, a_didx, a_smem_read_ptr, a_smem_write_ptr, meta_write_d_idx, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
+          0, packed_b_smem_read_ptr, packed_b_smem_write_ptr, 0, a_smem_read_ptr, a_smem_write_ptr, 0, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
       }
     }
 
-    meta_loader.load_fragment(lane_idx, fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
+    meta_loader.load_fragment(lane_idx, fragment_scales[0], scales_smem_read_ptr);
     scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
     meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
     scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
     constexpr int kPackBGloadsPerIter = mickey::div_up(PackedBLoader::kGloadSplit, WarpShape::kK / kFragPackedBStrideK);
     if constexpr (kFragPackedBStrideK == 32) {
-      packed_b_loader.load_fragment_k32(packed_b_smem_read_ptr, 0, fragment_packed_b[packed_b_write_didx].data());
+      packed_b_loader.load_fragment_k32(lane_idx, packed_b_smem_read_ptr, 0, fragment_packed_b[0].data());
     } else {
-      packed_b_loader.load_fragment_k64(packed_b_smem_read_ptr, 0, fragment_packed_b[packed_b_write_didx].data());
+      packed_b_loader.load_fragment_k64(lane_idx, packed_b_smem_read_ptr, 0, fragment_packed_b[0].data());
     }
-    packed_b_write_didx ^= 1;
 
-    packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-      packed_b_loader.load_to_smem_split();
+      packed_b_loader.load_to_smem_split(lane_idx, packed_b_smem_write_ptr, i);
     }
 
-    constexpr int kAGloadsPerIter = mickey::div_up(ATileLoader::kGloadSplit, WarpShape::kK / InstructionShape::kK);
-    a_tile_loader.load_fragment_k32(a_smem_read_ptr, 0, fragment_a[a_didx].data());
-    a_didx ^= 1;
+    constexpr int kAGloadsPerIter = mickey::div_up(ATileLoader::kGloadSplit, kMmaIterations);
+    a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr, 0, fragment_a[0].data());
 
-    a_tile_loader.new_tile_context(a_smem_write_ptr);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kAGloadsPerIter; ++i) {
-      a_tile_loader.load_to_smem_split();
+      a_tile_loader.load_to_smem_split(lane_idx, a_smem_write_ptr, i);
     }
 
     //
     // Main loop
     // proc_k = load_k - (kStages - 1) * WarpShape::kK
     //
-    CUTLASS_PRAGMA_UNROLL
     while (load_k < k_end + (kStages - 1) * WarpShape::kK){
-      // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
+
+      // One stage has kMmaIterations, we unroll the main loop by 2,
+      // as the meta data is loaded only once every stage, need 2 stages
+      // to complete a double buffer cycle. This is necessary to make
+      // all indices compile time constants.
       CUTLASS_PRAGMA_UNROLL
-      for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
+      for (int iter2 = 0; iter2 < kMmaIterations * 2; ++iter2) {
         // To speedup de-quantization, instead of using f = s * (q - z),
         // we use f = s * q + (s * -z) to take advantage of the fma
         // instruction. This is the storage of (s * -z)
         typename MetaLoader::FragmentScales fragment_addon;
 
         // Advance to the next stage of the main loop just one step eariler
-        const int inc = warp_k_offset + InstructionShape::kK;
-        if (inc == WarpShape::kK) {
+        const int next_iter2 = (iter2 + 1) % (kMmaIterations * 2);
+        const int next_iter = next_iter2 % kMmaIterations;
+        if (next_iter == 0) {
           cutlass::arch::cp_async_fence();
 
           // Advance write stage
@@ -610,8 +608,6 @@ struct QuantB4Gemm {
           a_smem_write_ptr += MainLoopSharedBuffer::kASizePerIter;
           ++a_tile_loader;
           advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr, scales_smem_write_ptr);
-          packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
-          a_tile_loader.new_tile_context(a_smem_write_ptr);
 
           // Advance read stage
           packed_b_smem_read_ptr += PackedBLoader::kBlockSize;
@@ -624,11 +620,10 @@ struct QuantB4Gemm {
           load_k += WarpShape::kK;
           if constexpr (kDebugPrintSteps) {
             if (lane_idx == 0) {
-              printf("fragment_scales[%d] <- load_k %d <- %p <- %p\n", meta_write_d_idx ^ 1, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
+              printf("fragment_scales[%d] <- load_k %d <- %p <- %p\n", (next_iter2 / kMmaIterations) % 2, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
             }
           }
-          meta_write_d_idx ^= 1;
-          meta_loader.load_fragment(lane_idx, fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
+          meta_loader.load_fragment(lane_idx, fragment_scales[(next_iter2 / kMmaIterations) % 2], scales_smem_read_ptr);
           scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
           meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
           scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
@@ -642,47 +637,40 @@ struct QuantB4Gemm {
           }
         }
 
-        if (warp_k_offset == 0) {
-          meta_read_d_idx ^= 1;
-          meta_loader.process(fragment_scales[meta_read_d_idx], fragment_addon);
-        }
-
-        if ((warp_k_offset % kFragPackedBStrideK) == 0) {
-          packed_b_read_didx ^= 1;
+        if ((iter2 % kMmaIterations)== 0) {
+          meta_loader.process(fragment_scales[(iter2 / kMmaIterations) % 2], fragment_addon);
         }
 
         // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
-        const int next_k_offset = inc % WarpShape::kK;
-        if ((next_k_offset % kFragPackedBStrideK) == 0) {
+        if ((next_iter2 % kMmaIterPerPackedB) == 0) {
           if constexpr (kDebugPrintSteps) {
             if (lane_idx == 0) {
-              printf("PackedB[%d] <- %p <- %p\n", packed_b_write_didx, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
+              printf("PackedB[%d] <- %p <- %p\n", (next_iter2 / kMmaIterPerPackedB) % 2, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
             }
           }
           if constexpr (kFragPackedBStrideK == 32) {
-            packed_b_loader.load_fragment_k32(packed_b_smem_read_ptr, next_k_offset, fragment_packed_b[packed_b_write_didx].data());
+            packed_b_loader.load_fragment_k32(lane_idx, packed_b_smem_read_ptr, next_iter * InstructionShape::kK, fragment_packed_b[(next_iter2 / kMmaIterPerPackedB) % 2].data());
           } else {
-            packed_b_loader.load_fragment_k64(packed_b_smem_read_ptr, next_k_offset, fragment_packed_b[packed_b_write_didx].data());
+            packed_b_loader.load_fragment_k64(lane_idx, packed_b_smem_read_ptr, next_iter * InstructionShape::kK, fragment_packed_b[(next_iter2 / kMmaIterPerPackedB) % 2].data());
           }
-          packed_b_write_didx ^= 1;
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-            packed_b_loader.load_to_smem_split();
+            const int idx = (next_iter / kMmaIterPerPackedB) * kPackBGloadsPerIter + i;
+            packed_b_loader.load_to_smem_split(lane_idx, packed_b_smem_write_ptr, idx);
           }
         }
 
         if constexpr (kDebugPrintSteps) {
           if (lane_idx == 0) {
-            printf("A[%d] <- %p <- %p\n",  a_didx, a_smem_read_ptr, a_smem_write_ptr);
+            printf("A[%d] <- %p <- %p\n",  (iter2 + 1) % 2, a_smem_read_ptr, a_smem_write_ptr);
           }
         }
-        a_tile_loader.load_fragment_k32(a_smem_read_ptr, next_k_offset * kElementSize, fragment_a[a_didx].data());
-        a_didx ^= 1;
+        a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr, next_iter * InstructionShape::kK * kElementSize, fragment_a[(iter2 + 1) % 2].data());
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kAGloadsPerIter; ++i) {
-          a_tile_loader.load_to_smem_split();
+          a_tile_loader.load_to_smem_split(lane_idx, a_smem_write_ptr, next_iter * kAGloadsPerIter + i);
         }
 
         if constexpr (kDebugPrintA) {
@@ -691,7 +679,7 @@ struct QuantB4Gemm {
             printf("====  A tiles =======\n");
           }
           const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          const ElementT* a_ptr = fragment_a[a_didx].data();
+          const ElementT* a_ptr = fragment_a[iter2 % 2].data();
           for (int m2_tile = 0; m2_tile < (WarpShape::kM / InstructionShape::kM); ++m2_tile, a_ptr += 8) {
             printf(format, float(a_ptr[0]), float(a_ptr[1]));
             printf(format, float(a_ptr[2]), float(a_ptr[3]));
@@ -702,15 +690,15 @@ struct QuantB4Gemm {
 
         if constexpr (kDebugPrintSteps) {
           if (lane_idx == 0) {
-            printf("Mma(PackedB[%d], fragment_scales[%d], A[%d])\n", packed_b_read_didx, meta_read_d_idx, a_didx);
+            printf("Mma(PackedB[%d], fragment_scales[%d], A[%d])\n", (iter2 / kMmaIterPerPackedB) % 2, (iter2 / kMmaIterations) % 2, iter2 % 2);
           }
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset, fragment_packed_b[packed_b_read_didx], fragment_scales[meta_read_d_idx], fragment_addon, fragment_b);
+        meta_loader.dequant_k16(iter2 % kMmaIterations, fragment_packed_b[(iter2 / kMmaIterPerPackedB) % 2], fragment_scales[(iter2 / kMmaIterations) % 2], fragment_addon, fragment_b);
 
         // GEMM operation, covering a shape of (WarpShape::kM, WarpShape::kN, InstructionShape::kK)
-        mma_op(accumulators, fragment_a[a_didx], fragment_b, accumulators);
+        mma_op(accumulators, fragment_a[iter2 % 2], fragment_b, accumulators);
       }  // next k block (stride = 16)
     }  // Main loop: next stage
 
