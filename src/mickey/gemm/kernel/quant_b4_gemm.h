@@ -407,8 +407,6 @@ struct QuantB4Gemm {
     const int warp_idx = div_power2<32>(threadIdx.x);
     const int lane_idx = mod_power2<32>(threadIdx.x);
     const int warp_idx_k = mod_power2<kSplitK>(warp_idx);
-    const int lane_b_k_offset = mod_power2<4>(lane_idx);
-    const int lane_b_n_offset = div_power2<4>(lane_idx);
 
 #ifndef NDEBUG
     bool assert_pass = true;
@@ -490,7 +488,7 @@ struct QuantB4Gemm {
 
     CUTLASS_PRAGMA_UNROLL
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
-      meta_loader.load_to_smem(load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
       scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
       // Load packed b
@@ -558,9 +556,9 @@ struct QuantB4Gemm {
       }
     }
 
-    meta_loader.load_fragment(fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
+    meta_loader.load_fragment(lane_idx, fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
     scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
-    meta_loader.load_to_smem(load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
+    meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
     scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
     constexpr int kPackBGloadsPerIter = mickey::div_up(PackedBLoader::kGloadSplit, WarpShape::kK / kFragPackedBStrideK);
@@ -571,22 +569,20 @@ struct QuantB4Gemm {
     }
     packed_b_write_didx ^= 1;
 
-    typename PackedBLoader::TileLoadContext packed_b_gload_ctx;
-    packed_b_loader.new_tile_context(packed_b_smem_write_ptr, packed_b_gload_ctx);
+    packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-      packed_b_loader.load_to_smem_split(packed_b_gload_ctx);
+      packed_b_loader.load_to_smem_split();
     }
 
     constexpr int kAGloadsPerIter = mickey::div_up(ATileLoader::kGloadSplit, WarpShape::kK / InstructionShape::kK);
     a_tile_loader.load_fragment_k32(a_smem_read_ptr, 0, fragment_a[a_didx].data());
     a_didx ^= 1;
 
-    typename ATileLoader::TileLoadContext a_gload_ctx;
-    a_tile_loader.new_tile_context(a_smem_write_ptr, a_gload_ctx);
+    a_tile_loader.new_tile_context(a_smem_write_ptr);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kAGloadsPerIter; ++i) {
-      a_tile_loader.load_to_smem_split(a_gload_ctx);
+      a_tile_loader.load_to_smem_split();
     }
 
     //
@@ -614,8 +610,8 @@ struct QuantB4Gemm {
           a_smem_write_ptr += MainLoopSharedBuffer::kASizePerIter;
           ++a_tile_loader;
           advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr, scales_smem_write_ptr);
-          packed_b_loader.new_tile_context(packed_b_smem_write_ptr, packed_b_gload_ctx);
-          a_tile_loader.new_tile_context(a_smem_write_ptr, a_gload_ctx);
+          packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
+          a_tile_loader.new_tile_context(a_smem_write_ptr);
 
           // Advance read stage
           packed_b_smem_read_ptr += PackedBLoader::kBlockSize;
@@ -632,9 +628,9 @@ struct QuantB4Gemm {
             }
           }
           meta_write_d_idx ^= 1;
-          meta_loader.load_fragment(fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
+          meta_loader.load_fragment(lane_idx, fragment_scales[meta_write_d_idx], scales_smem_read_ptr);
           scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
-          meta_loader.load_to_smem(load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
+          meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
           scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
           if constexpr(kDebugPrintB) {
@@ -651,13 +647,13 @@ struct QuantB4Gemm {
           meta_loader.process(fragment_scales[meta_read_d_idx], fragment_addon);
         }
 
-        if (mod_power2<kFragPackedBStrideK>(warp_k_offset) == 0) {
+        if ((warp_k_offset % kFragPackedBStrideK) == 0) {
           packed_b_read_didx ^= 1;
         }
 
         // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
-        const int next_k_offset = mod_power2<WarpShape::kK>(inc);
-        if (mod_power2<kFragPackedBStrideK>(next_k_offset) == 0) {
+        const int next_k_offset = inc % WarpShape::kK;
+        if ((next_k_offset % kFragPackedBStrideK) == 0) {
           if constexpr (kDebugPrintSteps) {
             if (lane_idx == 0) {
               printf("PackedB[%d] <- %p <- %p\n", packed_b_write_didx, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
@@ -672,7 +668,7 @@ struct QuantB4Gemm {
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-            packed_b_loader.load_to_smem_split(packed_b_gload_ctx);
+            packed_b_loader.load_to_smem_split();
           }
         }
 
@@ -681,12 +677,12 @@ struct QuantB4Gemm {
             printf("A[%d] <- %p <- %p\n",  a_didx, a_smem_read_ptr, a_smem_write_ptr);
           }
         }
-        a_tile_loader.load_fragment_k32(a_smem_read_ptr, mul_power2<kElementSize>(next_k_offset), fragment_a[a_didx].data());
+        a_tile_loader.load_fragment_k32(a_smem_read_ptr, next_k_offset * kElementSize, fragment_a[a_didx].data());
         a_didx ^= 1;
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kAGloadsPerIter; ++i) {
-          a_tile_loader.load_to_smem_split(a_gload_ctx);
+          a_tile_loader.load_to_smem_split();
         }
 
         if constexpr (kDebugPrintA) {
@@ -824,10 +820,10 @@ struct QuantB4Gemm {
     int output_stride = params.output_byte_stride_ / sizeof(__half2);
     const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data());
 
-    int n = n_start + lane_b_k_offset * 2;
+    int n = n_start + (mod_power2<4>(lane_idx) << 1);
     CUTLASS_PRAGMA_UNROLL
     for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile, n += 8) {
-      int m = m_start + lane_b_n_offset;
+      int m = m_start + div_power2<4>(lane_idx);
       CUTLASS_PRAGMA_UNROLL
       for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile, m += 8, ++c_ptr) {
         if (n < n_end && m < m_end) {

@@ -380,7 +380,7 @@ struct SwizzleDequantTestKernel {
       uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
       ElementT* scale_smem_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
     
-      meta_loader.load_to_smem(load_k, min(k_end, load_k + WarpShape::kK), scale_smem_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scale_smem_ptr);
 
       // Load packed b
       packed_b_loader.load_to_smem(packed_b_smem_ptr);
@@ -417,13 +417,12 @@ struct SwizzleDequantTestKernel {
       const ElementT* scale_smem_read_ptr = shared_scale_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter;
       ElementT* scale_smem_write_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
 
-      meta_loader.load_to_smem(load_k, min(k_end, load_k + WarpShape::kK), scale_smem_write_ptr);
-      meta_loader.load_fragment(fragment_scales, scale_smem_read_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scale_smem_write_ptr);
+      meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr);
 
       meta_loader.process(fragment_scales, fragment_addon);
 
-      typename PackedBLoader::TileLoadContext packed_b_gload_ctx;
-      packed_b_loader.new_tile_context(packed_b_smem_write_ptr, packed_b_gload_ctx);
+      packed_b_loader.new_tile_context(packed_b_smem_write_ptr);
 
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
@@ -440,7 +439,7 @@ struct SwizzleDequantTestKernel {
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-          packed_b_loader.load_to_smem_split(packed_b_gload_ctx);
+          packed_b_loader.load_to_smem_split();
         }
 
         // Dequantize weights block (16, WarpShape::kN)

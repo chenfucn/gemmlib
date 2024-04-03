@@ -67,11 +67,6 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     // our best to help spread these actions across different iterations
     // in a stage.
     static constexpr int kGloadSplit = SmemDimM / kGmemLoadStrideM;
-    struct TileLoadContext {
-        const uint8_t* data_ptr;
-        uint8_t* smem_ptr;
-        int idx;
-    };
 
   private:
     /// Pointer to global memory to load data from
@@ -84,6 +79,10 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     const int stride_;
     /// thread id in a warp
     const int lane_id_;
+
+    const uint8_t* split_ptr_;
+    uint8_t* split_smem_ptr_;
+    int split_idx_;
 
   public:
     CUTLASS_DEVICE
@@ -187,25 +186,21 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     }
 
     CUTLASS_DEVICE
-    void new_tile_context(void* smem, TileLoadContext& ctx) {
-        ctx.data_ptr = g_ptr_;
-        ctx.smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kLoadVectorSize>(Swizzled64{}(lane_id_));
-        ctx.idx = 0;
+    void new_tile_context(void* smem) {
+        split_ptr_ = g_ptr_;
+        split_smem_ptr_ = reinterpret_cast<uint8_t*>(smem) + mul_power2<kLoadVectorSize>(Swizzled64{}(lane_id_));
+        split_idx_ = 0;
     }
 
     CUTLASS_DEVICE
-    void load_to_smem_split(TileLoadContext& ctx){
-        if (ctx.data_ptr == nullptr || ctx.idx >= mn_cnt_) {
-            return;
-        }
-
+    void load_to_smem_split(){
         cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-            ctx.smem_ptr, ctx.data_ptr, true);
+            split_smem_ptr_, split_ptr_, g_ptr_ != nullptr && split_idx_ < mn_cnt_);
         // Here we rely on the fact that kThreads is 32, same as the swizzle pattern size
         static_assert(kGmemLoadStrideM == kSwizzleM);
-        ctx.data_ptr += mul_power2<kGmemLoadStrideM>(stride_);
-        ctx.smem_ptr += kSwizzleTileSize * kLoadVectorSize;
-        ++ctx.idx;
+        split_ptr_ += mul_power2<kGmemLoadStrideM>(stride_);
+        split_smem_ptr_ += kSwizzleTileSize * kLoadVectorSize;
+        ++split_idx_;
     }
 
     /**
@@ -343,11 +338,6 @@ class SwizzleTileLoader<SmemDimM_, 128> {
     // our best to help spread these actions across different iterations
     // in a stage.
     static constexpr int kGloadSplit = SmemDimM / kGmemLoadStrideM;
-    struct TileLoadContext {
-        const uint8_t* data_ptr;
-        uint8_t* smem_ptr[2];
-        int idx;
-    };
 
  private:
     /// Pointer to global memory to load data from
@@ -360,6 +350,10 @@ class SwizzleTileLoader<SmemDimM_, 128> {
     const int stride_;
     /// thread id in a warp
     const int lane_id_;
+
+        const uint8_t* split_ptr_;
+        uint8_t* split_smem_ptr_[2];
+        int split_idx_;
 
  public:
     CUTLASS_DEVICE
@@ -475,25 +469,21 @@ class SwizzleTileLoader<SmemDimM_, 128> {
     }
 
     CUTLASS_DEVICE
-    void new_tile_context(void* smem, TileLoadContext& ctx) {
-        ctx.data_ptr = g_ptr_;
-        ctx.smem_ptr[0] = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id_) * kLoadVectorSize;
-        ctx.smem_ptr[1] = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id_ + kThreads) * kLoadVectorSize;
-        ctx.idx = 0;
+    void new_tile_context(void* smem) {
+        split_ptr_ = g_ptr_;
+        split_smem_ptr_[0] = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id_) * kLoadVectorSize;
+        split_smem_ptr_[1] = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id_ + kThreads) * kLoadVectorSize;
+        split_idx_ = 0;
     }
 
     CUTLASS_DEVICE
-    void load_to_smem_split(TileLoadContext& ctx){
-        if (ctx.data_ptr == nullptr || ctx.idx >= mn_cnt_) {
-            return;
-        }
-
-        const int smem_idx = ctx.idx & 1;
+    void load_to_smem_split(){
+        const int smem_idx = split_idx_ & 1;
         cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-            ctx.smem_ptr[smem_idx], ctx.data_ptr, true);
-        ctx.data_ptr += stride_ * kGmemLoadStrideM;
-        ctx.smem_ptr[smem_idx] += kSwizzleTileSize * kLoadVectorSize;
-        ++ctx.idx;
+            split_smem_ptr_[smem_idx], split_ptr_, g_ptr_ != nullptr && split_idx_ < mn_cnt_);
+        split_ptr_ += stride_ * kGmemLoadStrideM;
+        split_smem_ptr_[smem_idx] += kSwizzleTileSize * kLoadVectorSize;
+        ++split_idx_;
     }
 
     /**
@@ -577,11 +567,6 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     // our best to help spread these actions across different iterations
     // in a stage.
     static constexpr int kGloadSplit = SmemDimM / kGmemLoadStrideM;
-    struct TileLoadContext {
-        const uint8_t* data_ptr;
-        uint8_t* smem_ptr;
-        int idx;
-    };
 
   private:
     /// Pointer to global memory to load data from
@@ -594,6 +579,10 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     const int stride_;
     /// thread id in a warp
     const int lane_id_;
+
+        const uint8_t* split_ptr_;
+        uint8_t* split_smem_ptr_;
+        int split_idx_;
 
   public:
     CUTLASS_DEVICE
@@ -697,25 +686,21 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     }
 
     CUTLASS_DEVICE
-    void new_tile_context(void* smem, TileLoadContext& ctx) {
-        ctx.data_ptr = g_ptr_;
-        ctx.smem_ptr = reinterpret_cast<uint8_t*>(smem) + Swizzled32{}(lane_id_) * kLoadVectorSize;
-        ctx.idx = 0;
+    void new_tile_context(void* smem) {
+        split_ptr_ = g_ptr_;
+        split_smem_ptr_ = reinterpret_cast<uint8_t*>(smem) + Swizzled32{}(lane_id_) * kLoadVectorSize;
+        split_idx_ = 0;
     }
 
     CUTLASS_DEVICE
-    void load_to_smem_split(TileLoadContext& ctx){
-        if (ctx.data_ptr == nullptr || ctx.idx >= mn_cnt_) {
-            return;
-        }
-
+    void load_to_smem_split(){
         cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-            ctx.smem_ptr, ctx.data_ptr, true);
+            split_smem_ptr_, split_ptr_, g_ptr_ != nullptr && split_idx_ < mn_cnt_);
         // Here we rely on the fact that kThreads is 32, same as the swizzle pattern size
         static_assert(kGmemLoadStrideM == kSwizzleM);
-        ctx.data_ptr += stride_ * kGmemLoadStrideM;
-        ctx.smem_ptr += kSwizzleTileSize * kLoadVectorSize;
-        ++ctx.idx;
+        split_ptr_ += stride_ * kGmemLoadStrideM;
+        split_smem_ptr_ += kSwizzleTileSize * kLoadVectorSize;
+        ++split_idx_;
     }
 
     /**

@@ -85,11 +85,10 @@ struct SwizzleLoaderTestKernel {
         k_start * sizeof(ElementT), k_end * sizeof(ElementT),
         lane_id);
     for (int load_k = k_start; load_k < k_end; load_k += WarpShape::kK) {
-      typename SwizzleLoader::TileLoadContext ctx;
-      loader.new_tile_context(shared_storage.storage, ctx);
+      loader.new_tile_context(shared_storage.storage);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < SwizzleLoader::kGloadSplit; ++i) {
-        loader.load_to_smem_split(ctx);
+        loader.load_to_smem_split();
       }
       ++loader;
 
