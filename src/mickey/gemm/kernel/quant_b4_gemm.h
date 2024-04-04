@@ -493,7 +493,7 @@ struct QuantB4Gemm {
 
     CUTLASS_PRAGMA_UNROLL
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scales_smem_write_ptr);
       scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
       // Load packed b
@@ -542,7 +542,6 @@ struct QuantB4Gemm {
     //
     // Prefix of the Mainloop, pre-loading the double buffer in registers
     //
-    int smem_read_stage = 0;
     uint8_t const* packed_b_smem_read_ptr = packed_b_shared_ptr;
     ElementT const* a_smem_read_ptr = a_shared_ptr;
     ElementT const* scales_smem_read_ptr = scales_shared_ptr;
@@ -555,9 +554,7 @@ struct QuantB4Gemm {
     }
 
     meta_loader.load_fragment(lane_idx, fragment_scales[0], scales_smem_read_ptr);
-    scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
-    meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
-    scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
+    meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scales_smem_write_ptr);
 
     constexpr int kPackBGloadsPerIter = mickey::div_up(PackedBLoader::kGloadSplit, WarpShape::kK / kFragPackedBStrideK);
     if constexpr (kFragPackedBStrideK == 32) {
@@ -602,17 +599,16 @@ struct QuantB4Gemm {
         if (next_iter == 0) {
           cutlass::arch::cp_async_fence();
 
-          // Advance write stage
-          packed_b_smem_write_ptr += PackedBLoader::kBlockSize;
+          const int read_stage_diff = (smem_write_stage == (kStages - 2)) ? (1 - kStages) : 1;
+          smem_write_stage = (smem_write_stage + 1) % kStages;
+          scales_smem_write_ptr = const_cast<ElementT*>(scales_smem_read_ptr);
+          packed_b_smem_write_ptr = const_cast<uint8_t*>(packed_b_smem_read_ptr);
+          a_smem_write_ptr = const_cast<ElementT*>(a_smem_read_ptr);
+          scales_smem_read_ptr += read_stage_diff * MainLoopSharedBuffer::kMetaSizePerIter;
+          packed_b_smem_read_ptr += read_stage_diff * MainLoopSharedBuffer::kPackedBSizePerIter;
+          a_smem_read_ptr += read_stage_diff * MainLoopSharedBuffer::kASizePerIter;
           ++packed_b_loader;
-          a_smem_write_ptr += MainLoopSharedBuffer::kASizePerIter;
           ++a_tile_loader;
-          advance_stage(smem_write_stage, packed_b_smem_write_ptr, a_smem_write_ptr, scales_smem_write_ptr);
-
-          // Advance read stage
-          packed_b_smem_read_ptr += PackedBLoader::kBlockSize;
-          a_smem_read_ptr += MainLoopSharedBuffer::kASizePerIter;
-          advance_stage(smem_read_stage, packed_b_smem_read_ptr, a_smem_read_ptr, scales_smem_read_ptr);
 
           cutlass::arch::cp_async_wait<kStages - 2>();
           //__syncthreads(); is this necessary since the loader is warp based?
@@ -623,10 +619,8 @@ struct QuantB4Gemm {
               printf("fragment_scales[%d] <- load_k %d <- %p <- %p\n", (next_iter2 / kMmaIterations) % 2, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
             }
           }
+          meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scales_smem_write_ptr);
           meta_loader.load_fragment(lane_idx, fragment_scales[(next_iter2 / kMmaIterations) % 2], scales_smem_read_ptr);
-          scales_smem_read_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
-          meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scales_smem_write_ptr);
-          scales_smem_write_ptr += MainLoopSharedBuffer::kMetaSizePerIter;
 
           if constexpr(kDebugPrintB) {
             if (lane_idx == 0) {
@@ -672,7 +666,6 @@ struct QuantB4Gemm {
         for (int i = 0; i < kAGloadsPerIter; ++i) {
           a_tile_loader.load_to_smem_split(lane_idx, a_smem_write_ptr, next_iter * kAGloadsPerIter + i);
         }
-
         if constexpr (kDebugPrintA) {
           const int lane_id = threadIdx.x % 32;
           if (lane_id == 0) {
@@ -688,13 +681,12 @@ struct QuantB4Gemm {
           }
         }
 
+        // Dequantize weights block (16, WarpShape::kN)
         if constexpr (kDebugPrintSteps) {
           if (lane_idx == 0) {
             printf("Mma(PackedB[%d], fragment_scales[%d], A[%d])\n", (iter2 / kMmaIterPerPackedB) % 2, (iter2 / kMmaIterations) % 2, iter2 % 2);
           }
         }
-
-        // Dequantize weights block (16, WarpShape::kN)
         meta_loader.dequant_k16(iter2 % kMmaIterations, fragment_packed_b[(iter2 / kMmaIterPerPackedB) % 2], fragment_scales[(iter2 / kMmaIterations) % 2], fragment_addon, fragment_b);
 
         // GEMM operation, covering a shape of (WarpShape::kM, WarpShape::kN, InstructionShape::kK)

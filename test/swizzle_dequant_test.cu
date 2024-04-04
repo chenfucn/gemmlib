@@ -380,7 +380,7 @@ struct SwizzleDequantTestKernel {
       uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
       ElementT* scale_smem_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
     
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scale_smem_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr);
 
       // Load packed b
       packed_b_loader.load_to_smem(lane_idx, packed_b_smem_ptr);
@@ -417,7 +417,7 @@ struct SwizzleDequantTestKernel {
       const ElementT* scale_smem_read_ptr = shared_scale_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter;
       ElementT* scale_smem_write_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
 
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end, load_k + WarpShape::kK), scale_smem_write_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_write_ptr);
       meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr);
 
       meta_loader.process(fragment_scales, fragment_addon);

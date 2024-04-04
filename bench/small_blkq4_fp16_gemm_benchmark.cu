@@ -187,7 +187,7 @@ using LayoutQMeta =
         cutlass::layout::ColumnMajor,
         cutlass::layout::RowMajor>::type;
 
-using WarpShape = cutlass::gemm::GemmShape<16, 32, 32>;
+using WarpShape = cutlass::gemm::GemmShape<16, 16, 64>;
 // Number of pipelines you want to use
 constexpr int NumStages = 3;
 constexpr int NumSplitK = 8;
