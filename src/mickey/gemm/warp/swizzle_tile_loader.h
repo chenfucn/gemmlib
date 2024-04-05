@@ -159,21 +159,14 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     */
     CUTLASS_DEVICE
     void load_to_smem(const int lane_id, void* smem) {
-        if (g_ptr_ == nullptr) {
-            return;
-        }
-
         // Here we rely on the fact that kThreads is 32, same as the swizzle pattern size
         static_assert(kGmemLoadStrideM == kSwizzleM);
         const uint8_t* data_ptr = g_ptr_;
         uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kLoadVectorSize>(Swizzled64{}(lane_id));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < SmemDimM / kSwizzleM; ++i) {
-            if (i >= mn_cnt_) {
-                break;
-            }
             cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr, data_ptr, true);
+                smem_ptr, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
             data_ptr += mul_power2<kGmemLoadStrideM>(stride_);
             smem_ptr += kSwizzleTileSize * kLoadVectorSize;
         }
@@ -195,11 +188,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
      * @brief Advance global memory pointer to the next tile in the K dimension
     */
     CUTLASS_DEVICE
-    SwizzleTileLoader& operator++() {
-        if (g_ptr_ == nullptr) {
-            return *this;
-        }
-    
+    SwizzleTileLoader& operator++() {    
         --k_cnt_;
         if (k_cnt_ > 0) {
             g_ptr_ += kLoadVectorSize * kSwizzleK;
@@ -419,9 +408,6 @@ class SwizzleTileLoader<SmemDimM_, 128> {
     */
     CUTLASS_DEVICE
     void load_to_smem(const int lane_id, void* smem) {
-        if (g_ptr_ == nullptr) {
-            return;
-        }
         const uint8_t* data_ptr = g_ptr_;
 
         // The swizzle pattern is 8x8, but we only have 32 threads,
@@ -431,20 +417,14 @@ class SwizzleTileLoader<SmemDimM_, 128> {
         uint8_t* smem_ptr1 = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id + kThreads) * kLoadVectorSize;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < SmemDimM / kGmemLoadStrideM;) {
-            if (i >= mn_cnt_) {
-                break;
-            }
             cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr0, data_ptr, true);
+                smem_ptr0, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
             data_ptr += stride_ * kGmemLoadStrideM;
             smem_ptr0 += kSwizzleTileSize * kLoadVectorSize;
             ++i;
 
-            if (i >= mn_cnt_) {
-                break;
-            }
             cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr1, data_ptr, true);
+                smem_ptr1, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
             data_ptr += stride_ * kGmemLoadStrideM;
             smem_ptr1 += kSwizzleTileSize * kLoadVectorSize;
             ++i;
@@ -466,11 +446,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
      * @brief Advance global memory pointer to the next tile in the K dimension
     */
     CUTLASS_DEVICE
-    SwizzleTileLoader& operator++() {
-        if (g_ptr_ == nullptr) {
-            return *this;
-        }
-    
+    SwizzleTileLoader& operator++() {    
         --k_cnt_;
         if (k_cnt_ > 0) {
             g_ptr_ += kLoadVectorSize * kSwizzleK;
@@ -650,21 +626,14 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     */
     CUTLASS_DEVICE
     void load_to_smem(const int lane_id, void* smem) {
-        if (g_ptr_ == nullptr) {
-            return;
-        }
-
         // The swizzle pattern is 2x16, same size as kThreads
         static_assert(kGmemLoadStrideM == kSwizzleM);
         const uint8_t* data_ptr = g_ptr_;
         uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem) + Swizzled32{}(lane_id) * kLoadVectorSize;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < SmemDimM / kSwizzleM; ++i) {
-            if (i >= mn_cnt_) {
-                break;
-            }
             cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr, data_ptr, true);
+                smem_ptr, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
             data_ptr += stride_ * kGmemLoadStrideM;
             smem_ptr += kSwizzleTileSize * kLoadVectorSize;
         }
@@ -687,10 +656,6 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     */
     CUTLASS_DEVICE
     SwizzleTileLoader& operator++() {
-        if (g_ptr_ == nullptr) {
-            return *this;
-        }
-    
         --k_cnt_;
         if (k_cnt_ > 0) {
             g_ptr_ += kLoadVectorSize * kSwizzleK;
