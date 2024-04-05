@@ -65,13 +65,17 @@ void weights2Half([[maybe_unused]] uint32_t const &weights,
 
   constexpr __half_raw kKilo{0x6400};
   constexpr half2 onek(kKilo, kKilo);
-  constexpr __half_raw k64{0x5400};
+  //1.0: 3c00, -64.0: d400
+  constexpr __half_raw k1{0x3c00};
+  constexpr half2 one(k1, k1);
+
+  constexpr __half_raw k64{0xd400};
   constexpr half2 sixtyfour{k64, k64};
 
   pairs[0] = __hsub2(pairs[0], onek);
-  pairs[1] = __hsub2(pairs[1], sixtyfour);
+  pairs[1] = __hfma2(pairs[1], one, sixtyfour);
   pairs[2] = __hsub2(pairs[2], onek);
-  pairs[3] = __hsub2(pairs[3], sixtyfour);
+  pairs[3] = __hfma2(pairs[3], one, sixtyfour);
 }
 
 template <int N>
