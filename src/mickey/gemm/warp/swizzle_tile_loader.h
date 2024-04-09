@@ -29,7 +29,7 @@ namespace warp {
  *        memory and then to fragment with ldmatrix instruction, with swizzling
  *        to avoid bank conflicts.
  */
-template <int SmemDimM, int SmemDimK>
+template <int SmemDimM, int SmemDimK, int NumThreads = 32>
 class SwizzleTileLoader;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -38,16 +38,16 @@ class SwizzleTileLoader;
 // Now we specialize for each case. Need to find a way to unify them.
 
 template <int SmemDimM_>
-class SwizzleTileLoader<SmemDimM_, 64> {
+class SwizzleTileLoader<SmemDimM_, 64, 32> {
   public:
     static constexpr int SmemDimM = SmemDimM_;
     static constexpr int SmemDimK = 64;
-    static constexpr int kLoadVectorSize = 16;  // one cp.async loads 16 bytes
+    static constexpr int kAccessSize = 16;  // one cp.async loads 16 bytes
     static constexpr int kBlockSize = SmemDimM * SmemDimK;
     static constexpr int kTiles = (SmemDimM / 8) * (SmemDimK / 16);
 
     // Swizzle pattern is 4x8
-    static constexpr int kSwizzleK = SmemDimK / kLoadVectorSize;
+    static constexpr int kSwizzleK = SmemDimK / kAccessSize;
     static_assert(kSwizzleK == cute::_4::value);
     static constexpr int kSwizzleM = cute::_8::value;
     static constexpr int kSwizzleTileSize = kSwizzleK * kSwizzleM;
@@ -91,47 +91,35 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     : stride_(byte_stride) {
     #ifndef NDEBUG
         bool assertion_pass = true;
-        if (reinterpret_cast<uintptr_t>(data_ptr) % kLoadVectorSize != 0) {
+        if (reinterpret_cast<uintptr_t>(data_ptr) % kAccessSize != 0) {
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
+            }
+        }
+        if (byte_stride % kAccessSize != 0) {
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
+            }
+        }
+        if (k_start % kAccessSize != 0) {
         assertion_pass = false;
-        if (lane_id == 0) {
-            printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
+            if (lane_id == 0) {
+                printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
+            }
         }
-        }
-        if (byte_stride % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
-        }
-        }
-        if (k_start % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
-        }
-        }
-        if (k_end % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
-        }
-        }
-        if (mn_end <= mn_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("mn_end: %d is less than or equal to mn_start: %d!\n", mn_end, mn_start);
-        }
-        }
-        if (k_end <= k_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is less than or equal to k_start: %d!\n", k_end, k_start);
-        }
+        if (k_end % kAccessSize != 0) {
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
+            }
         }
         if (lane_id < 0 || lane_id >= kThreads) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
+            }
         }
         assert(assertion_pass);
     #endif
@@ -139,10 +127,10 @@ class SwizzleTileLoader<SmemDimM_, 64> {
         int lane_m = div_power2<kSwizzleK>(lane_id);
         int lane_k = mod_power2<kSwizzleK>(lane_id);
         mn_start += lane_m;
-        k_start += mul_power2<kLoadVectorSize>(lane_k);
+        k_start += mul_power2<kAccessSize>(lane_k);
 
         mn_cnt_ = div_up(mn_end - mn_start, kGmemLoadStrideM);
-        k_cnt_ = div_up(k_end - k_start, kSwizzleK * kLoadVectorSize);
+        k_cnt_ = div_up(k_end - k_start, kSwizzleK * kAccessSize);
         if (mn_cnt_ <= 0 || k_cnt_ <= 0) {
             mn_cnt_ = 0;
             k_cnt_ = 0;
@@ -162,13 +150,13 @@ class SwizzleTileLoader<SmemDimM_, 64> {
         // Here we rely on the fact that kThreads is 32, same as the swizzle pattern size
         static_assert(kGmemLoadStrideM == kSwizzleM);
         const uint8_t* data_ptr = g_ptr_;
-        uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kLoadVectorSize>(Swizzled64{}(lane_id));
+        uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kAccessSize>(Swizzled64{}(lane_id));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < SmemDimM / kSwizzleM; ++i) {
-            cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
+            cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
                 smem_ptr, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
             data_ptr += mul_power2<kGmemLoadStrideM>(stride_);
-            smem_ptr += kSwizzleTileSize * kLoadVectorSize;
+            smem_ptr += kSwizzleTileSize * kAccessSize;
         }
     }
 
@@ -178,9 +166,9 @@ class SwizzleTileLoader<SmemDimM_, 64> {
         static_assert(kGmemLoadStrideM == kSwizzleM);
 
         const uint8_t* split_ptr = g_ptr_ + mul_power2<kGmemLoadStrideM>(split_idx * stride_);
-        uint8_t* split_smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kLoadVectorSize>(Swizzled64{}(lane_id)) + split_idx * kSwizzleTileSize * kLoadVectorSize;
+        uint8_t* split_smem_ptr = reinterpret_cast<uint8_t*>(smem) + mul_power2<kAccessSize>(Swizzled64{}(lane_id)) + split_idx * kSwizzleTileSize * kAccessSize;
 
-        cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
+        cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
             split_smem_ptr, split_ptr, g_ptr_ != nullptr && split_idx < mn_cnt_);
     }
 
@@ -191,7 +179,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
     SwizzleTileLoader& operator++() {    
         --k_cnt_;
         if (k_cnt_ > 0) {
-            g_ptr_ += kLoadVectorSize * kSwizzleK;
+            g_ptr_ += kAccessSize * kSwizzleK;
         } else {
             g_ptr_ = nullptr;
         }
@@ -203,7 +191,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
      * fitting fp16 gemm sm80 tensor core shape, where k = 16 x sizeof(fp16)
     */
     CUTLASS_DEVICE
-    void load_fragment_k32(const int lane_id, void const* smem, int offset_k, void* frag) {
+    static void load_fragment_k32(const int lane_id, void const* smem, int offset_k, void* frag) {
 #ifndef NDEBUG
         bool assert_fail = false;
         if (offset_k != 0 && offset_k != 32) {
@@ -231,7 +219,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
         int m_tile_offset = mod_power2<kSwizzleM>(m_lane_id);
         int swizzled_id = Swizzled64{}(k_lane_id, m_tile_offset) + mul_power2<kSwizzleTileSize>(m_tile_id);
         // printf("lane_id: %d, m_lane_id: %d, k_lane_id: %d, swizzled_id: %d\n", lane_id, m_lane_id, k_lane_id, swizzled_id);
-        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + mul_power2<kLoadVectorSize>(swizzled_id);
+        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + mul_power2<kAccessSize>(swizzled_id);
 
         using FragType = cutlass::Array<unsigned, 4>;
         FragType* frag_ptr = reinterpret_cast<FragType*>(frag);
@@ -240,7 +228,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
         for (int i = 0; i < (SmemDimM / 16); ++i) {
             // printf("lane_id: %d, load %d, val: %d, smem_ptr: %p\n", lane_id, i, smem_ptr[0], smem_ptr);
             cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(frag_ptr[i], smem_ptr);
-            smem_ptr += kSwizzleTileSize * kStrideM * kLoadVectorSize;
+            smem_ptr += kSwizzleTileSize * kStrideM * kAccessSize;
         }
     }
 
@@ -276,7 +264,7 @@ class SwizzleTileLoader<SmemDimM_, 64> {
 
         int swizzled_id = Swizzled64{}(k_lane_id, m_lane_id);
         // printf("lane_id: %d, m_lane_id: %d, k_lane_id: %d, swizzled_id: %d\n", lane_id, m_lane_id, k_lane_id, swizzled_id);
-        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + mul_power2<kLoadVectorSize>(swizzled_id);
+        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + mul_power2<kAccessSize>(swizzled_id);
 
         using FragType = cutlass::Array<unsigned, 4>;
         FragType* frag_ptr = reinterpret_cast<FragType*>(frag);
@@ -287,17 +275,17 @@ class SwizzleTileLoader<SmemDimM_, 64> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int SmemDimM_>
-class SwizzleTileLoader<SmemDimM_, 128> {
+template <int SmemDimM_, int NumThreads_>
+class SwizzleTileLoader<SmemDimM_, 128, NumThreads_> {
   public:
     static constexpr int SmemDimM = SmemDimM_;
     static constexpr int SmemDimK = 128;
-    static constexpr int kLoadVectorSize = 16;  // one cp.async loads 16 bytes
+    static constexpr int kAccessSize = 16;  // one cp.async loads 16 bytes
     static constexpr int kBlockSize = SmemDimM * SmemDimK;
     static constexpr int kTiles = (SmemDimM / 8) * (SmemDimK / 16);
 
     // Swizzle pattern is 8x8
-    static constexpr int kSwizzleK = SmemDimK / kLoadVectorSize;
+    static constexpr int kSwizzleK = SmemDimK / kAccessSize;
     static_assert(kSwizzleK == cute::_8::value);
     static constexpr int kSwizzleM = cute::_8::value;
     static constexpr int kSwizzleTileSize = kSwizzleK * kSwizzleM;
@@ -306,9 +294,10 @@ class SwizzleTileLoader<SmemDimM_, 128> {
                           cute::Layout<cute::Shape<cute::_8, cute::_8>,
                                        cute::Stride<cute::_1, cute::_8>>{}));
     
-    static constexpr int kThreads = 32;
+    static constexpr int kThreads = NumThreads_;
     static constexpr int kGmemLoadStrideM = kThreads / kSwizzleK;
-    static_assert(kGmemLoadStrideM * kSwizzleK == kThreads);
+    static_assert(kThreads % 32 == 0); // whole warp only
+    static_assert(SmemDimM % kGmemLoadStrideM == 0);
 
     // During pipelined MMA, each stage (processing a tile) is split
     // into multiple mma iterations. We need to somehow split the
@@ -336,62 +325,50 @@ class SwizzleTileLoader<SmemDimM_, 128> {
         int mn_end,            ///< End position in the M or N dimension
         int k_start,           ///< Starting position in the K dimension
         int k_end,             ///< End position in the K dimension
-        int lane_id)           ///< ID of each participating thread
+        int thread_id)           ///< ID of each participating thread
     : stride_(byte_stride) {
     #ifndef NDEBUG
         bool assertion_pass = true;
-        if (reinterpret_cast<uintptr_t>(data_ptr) % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
+        if (reinterpret_cast<uintptr_t>(data_ptr) % kAccessSize != 0) {
+            assertion_pass = false;
+            if (thread_id == 0) {
+                printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
+            }
         }
+        if (byte_stride % kAccessSize != 0) {
+            assertion_pass = false;
+            if (thread_id == 0) {
+                printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
+            }
         }
-        if (byte_stride % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
+        if (k_start % kAccessSize != 0) {
+            assertion_pass = false;
+            if (thread_id == 0) {
+                printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
+            }
         }
+        if (k_end % kAccessSize != 0) {
+            assertion_pass = false;
+            if (thread_id == 0) {
+                printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
+            }
         }
-        if (k_start % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
-        }
-        }
-        if (k_end % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
-        }
-        }
-        if (mn_end <= mn_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("mn_end: %d is less than or equal to mn_start: %d!\n", mn_end, mn_start);
-        }
-        }
-        if (k_end <= k_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is less than or equal to k_start: %d!\n", k_end, k_start);
-        }
-        }
-        if (lane_id < 0 || lane_id >= kThreads) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
-        }
+        if (thread_id < 0 || thread_id >= kThreads) {
+            assertion_pass = false;
+            if (thread_id == 0) {
+                printf("Warp based loader, thread_id should be [0-%d) but it is: %d!\n", kThreads, thread_id);
+            }
         }
         assert(assertion_pass);
     #endif
 
-        int lane_m = lane_id / kSwizzleK;
-        int lane_k = lane_id % kSwizzleK;
+        int lane_m = thread_id / kSwizzleK;
+        int lane_k = thread_id % kSwizzleK;
         mn_start += lane_m;
-        k_start += lane_k * kLoadVectorSize;
+        k_start += lane_k * kAccessSize;
 
         mn_cnt_ = div_up(mn_end - mn_start, kGmemLoadStrideM);
-        k_cnt_ = div_up(k_end - k_start, kSwizzleK * kLoadVectorSize);
+        k_cnt_ = div_up(k_end - k_start, kSwizzleK * kAccessSize);
         if (mn_cnt_ <= 0 || k_cnt_ <= 0) {
             mn_cnt_ = 0;
             k_cnt_ = 0;
@@ -399,47 +376,70 @@ class SwizzleTileLoader<SmemDimM_, 128> {
             return;
         }
         g_ptr_ = reinterpret_cast<uint8_t const*>(data_ptr) + mn_start * byte_stride + k_start;
-        // if (lane_id == 0)
-        //   printf("lane_id: %d, mn_start: %d, mn_end: %d, k_start: %d, k_end: %d, g_ptr: %p\n", lane_id, mn_start, mn_end, k_start, k_end, g_ptr_);
+        // if (thread_id == 0)
+        //   printf("thread_id: %d, mn_start: %d, mn_end: %d, k_start: %d, k_end: %d, g_ptr: %p\n", thread_id, mn_start, mn_end, k_start, k_end, g_ptr_);
     }
 
     /**
      * @brief Load a row major tile (SmemDimM, 128) from global memory to shared memory 
     */
     CUTLASS_DEVICE
-    void load_to_smem(const int lane_id, void* smem) {
+    void load_to_smem(const int thread_id, void* smem) {
         const uint8_t* data_ptr = g_ptr_;
 
-        // The swizzle pattern is 8x8, but we only have 32 threads,
-        // covering half of the swizzle pattern
-        static_assert(kGmemLoadStrideM * 2 == kSwizzleM);
-        uint8_t* smem_ptr0 = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id) * kLoadVectorSize;
-        uint8_t* smem_ptr1 = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(lane_id + kThreads) * kLoadVectorSize;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < SmemDimM / kGmemLoadStrideM;) {
-            cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr0, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
-            data_ptr += stride_ * kGmemLoadStrideM;
-            smem_ptr0 += kSwizzleTileSize * kLoadVectorSize;
-            ++i;
+        if constexpr (kThreads == 32) {
+            // The swizzle pattern is 8x8, but we only have 32 threads,
+            // covering half of the swizzle pattern
+            uint8_t* smem_ptr0 = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(thread_id) * kAccessSize;
+            uint8_t* smem_ptr1 = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(thread_id + kThreads) * kAccessSize;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < SmemDimM / kGmemLoadStrideM;) {
+                cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
+                    smem_ptr0, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
+                data_ptr += stride_ * kGmemLoadStrideM;
+                smem_ptr0 += kSwizzleTileSize * kAccessSize;
+                ++i;
 
-            cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-                smem_ptr1, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
-            data_ptr += stride_ * kGmemLoadStrideM;
-            smem_ptr1 += kSwizzleTileSize * kLoadVectorSize;
-            ++i;
+                cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
+                    smem_ptr1, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
+                data_ptr += stride_ * kGmemLoadStrideM;
+                smem_ptr1 += kSwizzleTileSize * kAccessSize;
+                ++i;
+            }
+        } else {
+            // kThreads is 64, 128, 256, etc.
+            // The swizzle pattern is 8x8, and we have enough threads to cover it
+            const int pattern_offset = (thread_id / 64) * kSwizzleTileSize * kAccessSize;
+            uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem) + Swizzled128{}(thread_id % 64) * kAccessSize + pattern_offset;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < SmemDimM / kGmemLoadStrideM; ++i) {
+                cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
+                    smem_ptr, data_ptr, g_ptr_ != nullptr && i < mn_cnt_);
+                data_ptr += stride_ * kGmemLoadStrideM;
+                smem_ptr += kGmemLoadStrideM * kSwizzleK * kAccessSize;
+            }
         }
     }
 
     CUTLASS_DEVICE
-    void load_to_smem_split(const int lane_id, void* smem, const int split_idx){
+    void load_to_smem_split(const int thread_id, void* smem, const int split_idx){
         const uint8_t* split_ptr = g_ptr_ + split_idx * stride_ * kGmemLoadStrideM;
-        const int offset = (split_idx >> 1) * kSwizzleTileSize * kLoadVectorSize;
-        const int swizzled = Swizzled128{}(lane_id + (split_idx & 1) * kThreads) * kLoadVectorSize;
-        uint8_t* split_smem_ptr = reinterpret_cast<uint8_t*>(smem) + swizzled + offset;
 
-        cutlass::arch::cp_async<kLoadVectorSize, cutlass::arch::CacheOperation::Global>(
-            split_smem_ptr, split_ptr, g_ptr_ != nullptr && split_idx < mn_cnt_);
+        if constexpr (kThreads == 32) {
+            const int offset = (split_idx >> 1) * kSwizzleTileSize * kAccessSize;
+            const int swizzled = Swizzled128{}(thread_id + (split_idx & 1) * kThreads) * kAccessSize;
+            uint8_t* split_smem_ptr = reinterpret_cast<uint8_t*>(smem) + swizzled + offset;
+
+            cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
+                split_smem_ptr, split_ptr, g_ptr_ != nullptr && split_idx < mn_cnt_);
+        } else {
+            const int pattern_offset = (thread_id / 64) * kSwizzleTileSize * kAccessSize;
+            const int swizzled = Swizzled128{}(thread_id % 64) * kAccessSize;
+            uint8_t* split_smem_ptr = reinterpret_cast<uint8_t*>(smem) + swizzled + pattern_offset + split_idx * kGmemLoadStrideM * kSwizzleK * kAccessSize;
+
+            cutlass::arch::cp_async<kAccessSize, cutlass::arch::CacheOperation::Global>(
+                split_smem_ptr, split_ptr, g_ptr_ != nullptr && split_idx < mn_cnt_);
+        }
     }
 
     /**
@@ -449,7 +449,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
     SwizzleTileLoader& operator++() {    
         --k_cnt_;
         if (k_cnt_ > 0) {
-            g_ptr_ += kLoadVectorSize * kSwizzleK;
+            g_ptr_ += kAccessSize * kSwizzleK;
         } else {
             g_ptr_ = nullptr;
         }
@@ -461,7 +461,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
      * fitting fp16 gemm sm80 tensor core shape, where k = 16 x sizeof(fp16)
     */
     CUTLASS_DEVICE
-    void load_fragment_k32(const int lane_id, void const* smem, int offset_k, void* frag) {
+    static void load_fragment_k32(const int lane_id, void const* smem, int offset_k, void* frag) {
 #ifndef NDEBUG
         bool assert_fail = false;
         if ((offset_k % 32) != 0) {
@@ -478,6 +478,12 @@ class SwizzleTileLoader<SmemDimM_, 128> {
                 printf("SmemDimM: %d two small, cannot use ldmatrix fully!\n", SmemDimM);
             }
         }
+        if (lane_id < 0 || lane_id >= 32) {
+            assert_fail = true;
+            if (lane_id == 0) {
+                printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
+            }
+        }
         assert(assert_fail == false);
 #endif
 
@@ -489,7 +495,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
         int m_tile_offset = m_lane_id % kSwizzleM;
         int swizzled_id = Swizzled128{}(k_lane_id, m_tile_offset) + m_tile_id * kSwizzleTileSize;
         // printf("lane_id: %d, m_lane_id: %d, k_lane_id: %d, swizzled_id: %d\n", lane_id, m_lane_id, k_lane_id, swizzled_id);
-        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + swizzled_id * kLoadVectorSize;
+        const uint8_t* smem_ptr = reinterpret_cast<const uint8_t*>(smem) + swizzled_id * kAccessSize;
 
         using FragType = cutlass::Array<unsigned, 4>;
         FragType* frag_ptr = reinterpret_cast<FragType*>(frag);
@@ -498,7 +504,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
         for (int i = 0; i < SmemDimM / 16; ++i) {
             // printf("lane_id: %d, load %d, val: %d, smem_ptr: %p\n", lane_id, i, smem_ptr[0], smem_ptr);
             cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(frag_ptr[i], smem_ptr);
-            smem_ptr += kSwizzleTileSize * kStrideM * kLoadVectorSize;
+            smem_ptr += kSwizzleTileSize * kStrideM * kAccessSize;
         }
     }
 };
@@ -506,7 +512,7 @@ class SwizzleTileLoader<SmemDimM_, 128> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int SmemDimM_>
-class SwizzleTileLoader<SmemDimM_, 32> {
+class SwizzleTileLoader<SmemDimM_, 32, 32> {
   public:
     static constexpr int SmemDimM = SmemDimM_;
     static constexpr int SmemDimK = 32;
@@ -559,46 +565,34 @@ class SwizzleTileLoader<SmemDimM_, 32> {
     #ifndef NDEBUG
         bool assertion_pass = true;
         if (reinterpret_cast<uintptr_t>(data_ptr) % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("data_ptr: %p is not aligned to 16B boundary!\n", data_ptr);
+            }
         }
         if (byte_stride % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("byte_stride: %d is not aligned to 16B boundary!\n", byte_stride);
+            }
         }
         if (k_start % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("k_start: %d is not aligned to 16B boundary!\n", k_start);
+            }
         }
         if (k_end % kLoadVectorSize != 0) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
-        }
-        }
-        if (mn_end <= mn_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("mn_end: %d is less than or equal to mn_start: %d!\n", mn_end, mn_start);
-        }
-        }
-        if (k_end <= k_start) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("k_end: %d is less than or equal to k_start: %d!\n", k_end, k_start);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
+            }
         }
         if (lane_id < 0 || lane_id >= kThreads) {
-        assertion_pass = false;
-        if (lane_id == 0) {
-            printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
-        }
+            assertion_pass = false;
+            if (lane_id == 0) {
+                printf("Warp based loader, lane_id should be [0-32) but it is: %d!\n", lane_id);
+            }
         }
         assert(assertion_pass);
     #endif

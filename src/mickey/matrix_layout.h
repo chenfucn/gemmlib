@@ -173,10 +173,10 @@ class MatrixRef {
   Layout layout() const { return layout_; }
 
   CUTLASS_HOST_DEVICE
-  Index stride() const { return layout_.stride(); }
+  LongIndex stride(int idx) const { return layout_.stride(idx); }
 
   CUTLASS_HOST_DEVICE
-  Index& stride() { return layout_.stride(); }
+  LongIndex& stride(int idx) { return layout_.stride(idx); }
 
   /// Computes the offset of an index from the origin of the tensor
   CUTLASS_HOST_DEVICE

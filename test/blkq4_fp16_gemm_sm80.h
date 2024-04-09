@@ -225,6 +225,71 @@ void prepack_quant_offsets_ref(
   }
 }
 
+/**
+ * @brief Pack a quantized int4 tensor to a form that can be easily loaded into GPU registers
+ * without causing bank conflicts.
+ * 
+ * Each 16x16 int4 tile is packed to a 8x8 16b tile. This 8x8 16b tile is then serialized to
+ * a 128 byte vector, which fits into a shared memory cache line perfectly without causing bank
+ * conflicts.
+*/
+static inline void pack_q4_128b(
+    int in_features, // k
+    int out_features, // n
+    const mickey::MatrixRef<uint8_t const, cutlass::layout::ColumnMajor, true>& tensor_weight,
+    const mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true>& tensor_weight_prepacked) {
+  const int K = in_features;
+  const int N = out_features;
+
+  const int n_tiles = N / 16;
+  const int k_tiles = K / 16;
+
+  const size_t packed_n = n_tiles;
+  const size_t packed_k = k_tiles * 128;
+
+  if (tensor_weight.shape()[0] != K / 2 || tensor_weight.shape()[1] != N) {
+    throw std::runtime_error("Unexpected tensor_weight shape! Expected: (" +
+                             std::to_string(K / 2) + ", " + std::to_string(N) + "), Got: (" +
+                             std::to_string(tensor_weight.shape()[0]) + ", " + std::to_string(tensor_weight.shape()[1]) + ").");
+  }
+  if (tensor_weight_prepacked.shape()[0] != packed_k || tensor_weight_prepacked.shape()[1] != packed_n) {
+    throw std::runtime_error("Unexpected tensor_weight_prepacked shape! Expected: (" +
+                             std::to_string(K) + ", " + std::to_string(N / 2) + "), Got: (" +
+                             std::to_string(tensor_weight_prepacked.shape()[0]) + ", " + std::to_string(tensor_weight_prepacked.shape()[1]) + ").");
+  }
+
+  auto t0_base = cutlass::make_Coord(0, 0);
+  auto t1_base = cutlass::make_Coord(4, 0);
+  auto t2_base = cutlass::make_Coord(0, 8);
+  auto t3_base = cutlass::make_Coord(4, 8);
+  for (int col_dtile = 0; col_dtile < n_tiles; ++col_dtile) {
+    for (int row_dtile = 0; row_dtile < k_tiles; ++row_dtile) {
+      // Packing from a 8x16 tile to a 16x8 tile
+      auto dtile_base = cutlass::make_Coord(row_dtile * 8, col_dtile * 16);
+      auto packed_tile_base = cutlass::make_Coord(row_dtile * 128, col_dtile);
+      for (int col = 0; col < 8; ++col) {
+        for (int row = 0; row < 4; ++row) {
+          auto cord = cutlass::make_Coord(row, col);
+          auto packed_cord = packed_tile_base + cutlass::make_Coord(col * 16 + row * 4, 0);  // packed tile is 16x8
+          uint8_t buf[4];
+          buf[0] = tensor_weight.at(dtile_base + t0_base + cord);
+          buf[1] = tensor_weight.at(dtile_base + t1_base + cord);
+          buf[2] = tensor_weight.at(dtile_base + t2_base + cord);
+          buf[3] = tensor_weight.at(dtile_base + t3_base + cord);
+
+          // [0, 1, 2, 3, 4, 5, 6, 7] => [0, 2, 4, 6, 1, 3, 5, 7] so that each pair of adjacent weights
+          // are in different b16 register at the same positions. This makes it easier to convert to
+          // fp16x2 format in a b32 register
+          tensor_weight_prepacked.at(packed_cord) = (buf[0] & 0x0f) | ((buf[1] & 0x0f) << 4);
+          tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(1, 0)) = (buf[2] & 0x0f) | ((buf[3] & 0x0f) << 4);
+          tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(2, 0)) = ((buf[0] & 0xf0) >> 4) | (buf[1] & 0xf0);
+          tensor_weight_prepacked.at(packed_cord + cutlass::make_Coord(3, 0)) = ((buf[2] & 0xf0) >> 4) | (buf[3] & 0xf0);
+        }
+      }
+    }
+  }
+}
+
 /*
 template <
     int block_size,
