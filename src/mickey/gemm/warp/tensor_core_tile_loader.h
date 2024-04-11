@@ -166,7 +166,7 @@ class TensorCoreTileLoader {
 
   /// Loads a tile from global memory to shared memory
   CUTLASS_DEVICE
-  void load_to(void* smem_lane_ptr) const {
+  void load_to_smem(void* smem_lane_ptr) const {
     const uint8_t *ptr = g_ptr_;
     uint8_t *smem_lane_ptr_ = reinterpret_cast<uint8_t*>(smem_lane_ptr);
 

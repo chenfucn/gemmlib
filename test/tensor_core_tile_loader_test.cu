@@ -307,7 +307,7 @@ struct LoadPackedBTestKernel {
       ElementT* scale_smem_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
     
       meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpBShape::kK), scale_smem_ptr);
-      packed_b_loader.load_to(packed_b_smem_ptr);
+      packed_b_loader.load_to_smem(packed_b_smem_ptr);
       ++packed_b_loader;
 
       cutlass::arch::cp_async_fence();
@@ -341,7 +341,7 @@ struct LoadPackedBTestKernel {
 
       meta_loader.process(fragment_scales, fragment_addon);
 
-      packed_b_loader.load_to(packed_b_smem_write_ptr);
+      packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
       ++packed_b_loader;
 
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape

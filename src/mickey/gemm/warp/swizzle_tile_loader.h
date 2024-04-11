@@ -325,7 +325,7 @@ class SwizzleTileLoader<SmemDimM_, 128, NumThreads_> {
         int mn_end,            ///< End position in the M or N dimension
         int k_start,           ///< Starting position in the K dimension
         int k_end,             ///< End position in the K dimension
-        int thread_id)           ///< ID of each participating thread
+        unsigned int thread_id) ///< ID of each participating thread
     : stride_(byte_stride) {
     #ifndef NDEBUG
         bool assertion_pass = true;
@@ -353,7 +353,7 @@ class SwizzleTileLoader<SmemDimM_, 128, NumThreads_> {
                 printf("k_end: %d is not aligned to 16B boundary!\n", k_end);
             }
         }
-        if (thread_id < 0 || thread_id >= kThreads) {
+        if (thread_id >= kThreads) {
             assertion_pass = false;
             if (thread_id == 0) {
                 printf("Warp based loader, thread_id should be [0-%d) but it is: %d!\n", kThreads, thread_id);
@@ -422,7 +422,7 @@ class SwizzleTileLoader<SmemDimM_, 128, NumThreads_> {
     }
 
     CUTLASS_DEVICE
-    void load_to_smem_split(const int thread_id, void* smem, const int split_idx){
+    void load_to_smem_split(const unsigned int thread_id, void* smem, const int split_idx){
         const uint8_t* split_ptr = g_ptr_ + split_idx * stride_ * kGmemLoadStrideM;
 
         if constexpr (kThreads == 32) {

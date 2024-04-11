@@ -42,18 +42,18 @@ namespace test {
 
 template <
   typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
-  typename WarpShape_,                  ///! Warp-scoped matrix multiply-accumulate
+  typename ThreadblockShape_,           ///! Threadblock-scoped matrix multiply-accumulate
   int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
   int Stages_ = 4                       ///! Stages of the pipelined mainloop
 >
 class QuantB4GemmTestDevKernel {
  public:
   using QuantBlocking = QuantBlocking_;
-  using WarpShape = WarpShape_;
+  using ThreadblockShape = ThreadblockShape_;
   static constexpr int kSplitK = SplitKSerial_;
   static constexpr int kStages = Stages_;
 
-  using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, WarpShape, kSplitK, kStages>;
+  using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, kSplitK, kStages>;
   using Args = typename TestKernel::Params;
 
   cutlass::Status run(
@@ -77,7 +77,7 @@ class QuantB4GemmTestDevKernel {
     }
 
     dim3 grid(args.grid_tiled_shape_.m(), args.grid_tiled_shape_.n(), args.grid_tiled_shape_.k());
-    dim3 block(TestKernel::kThreadCount, 1, 1);
+    dim3 block(TestKernel::kThreads, 1, 1);
 
     cudaError_t result;
 
@@ -120,14 +120,14 @@ void print_tiled_tensor(cutlass::HostTensor<ElementT, LayoutT>& t) {
 }
 
 
-template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
+template <typename QuantBlocking, typename ThreadblockShape, int kSplitK, int kStages>
 void test_quantb4_gemm(int m, int n, int k) {
   std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
-            << " WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
+            << " ThreadblockShape: " << ThreadblockShape::kM << "x" << ThreadblockShape::kN << "x" << ThreadblockShape::kK
             << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
   std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
 
-  using Test = QuantB4GemmTestDevKernel<QuantBlocking, WarpShape, kSplitK, kStages>;
+  using Test = QuantB4GemmTestDevKernel<QuantBlocking, ThreadblockShape, kSplitK, kStages>;
   Test test;
   cutlass::gemm::GemmCoord problem_size(m, n, k);
 
@@ -189,11 +189,13 @@ void test_quantb4_gemm(int m, int n, int k) {
   }
 #endif
 
+  // Pack the weights, each int4 16x16 block is packed to a 128b vector on the k dimension
   std::vector<uint8_t> packed_w_ref(k * n / 2);
   mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_packed_w_ref(
-      packed_w_ref, cutlass::make_Coord(k, n / 2));
-  onnxruntime::cuda::test::prepack_weights_ref(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
+      packed_w_ref, cutlass::make_Coord(k * (128 / 16), n / 16));
+  onnxruntime::cuda::test::pack_q4_128b(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
 
+  int packed_b_stride = tensor_packed_w_ref.stride(0);
   int meta_tensor_stride = scales.stride(0);
   thrust::device_vector<cutlass::half_t> packed_scale_dev;
 
@@ -222,7 +224,7 @@ void test_quantb4_gemm(int m, int n, int k) {
   cutlass::Status status = test.run(nullptr, problem_size,
                                     tensor_d.device_data(), tensor_d.stride(0) * sizeof(cutlass::half_t),
                                     tensor_a.device_data(), tensor_a.stride(0) * sizeof(cutlass::half_t),
-                                    thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
+                                    thrust::raw_pointer_cast(packed_w_dev.data()), packed_b_stride,
                                     thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
   ASSERT_EQ(status, cutlass::Status::kSuccess);
   tensor_d.sync_host();
@@ -282,16 +284,15 @@ void test_quantb4_gemm(int m, int n, int k) {
 }
 
 TEST(QuantB4Gemm, PackedBTest) {
-  // test_quantb4_gemm<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<16, 64, 16>, 4, 2>(31, 128 + 32, 1024 + 16);
-  // test_quantb4_gemm<cutlass::MatrixShape<128, 1>, cutlass::gemm::GemmShape<16, 64, 16>, 8, 3>(67, 128 + 16, 4096 + 128);
+  // test_quantb4_gemm<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(65, 48, 1024 + 128);
+  // test_quantb4_gemm<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<16, 16, 64>, 4, 4>(1, 128, 4096 + 16);
 
-  test_quantb4_gemm<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<16, 16, 64>, 2, 3>(65, 48, 1024 + 128);
-  test_quantb4_gemm<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<16, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+  // test_quantb4_gemm<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 3>(35, 48, 32 * 4 + 16);
+  // test_quantb4_gemm<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 2>(35, 48, 32 * 3 + 16);
+  // test_quantb4_gemm<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
+  // test_quantb4_gemm<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
 
-  test_quantb4_gemm<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 3>(35, 48, 32 * 4 + 16);
-  test_quantb4_gemm<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<32, 32, 32>, 1, 2>(35, 48, 32 * 3 + 16);
-  test_quantb4_gemm<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
-  test_quantb4_gemm<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
+  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 1, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
 
   // test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
   // test_quantb4_gemm<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 2>(170, 176, 2048 + 32);

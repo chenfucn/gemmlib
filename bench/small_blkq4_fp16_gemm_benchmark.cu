@@ -117,18 +117,18 @@ struct Options {
 
 template <
   typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
-  typename WarpShape_,                  ///! Warp-scoped matrix multiply-accumulate
+  typename ThreadblockShape_,                  ///! Warp-scoped matrix multiply-accumulate
   int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
   int Stages_ = 4                       ///! Stages of the pipelined mainloop
 >
 class QuantB4GemmTestDevKernel {
  public:
   using QuantBlocking = QuantBlocking_;
-  using WarpShape = WarpShape_;
+  using ThreadblockShape = ThreadblockShape_;
   static constexpr int kSplitK = SplitKSerial_;
   static constexpr int kStages = Stages_;
 
-  using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, WarpShape, kSplitK, kStages>;
+  using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, kSplitK, kStages>;
   using Args = typename TestKernel::Params;
 
   cutlass::Status run(
@@ -187,12 +187,12 @@ using LayoutQMeta =
         cutlass::layout::ColumnMajor,
         cutlass::layout::RowMajor>::type;
 
-using WarpShape = cutlass::gemm::GemmShape<16, 16, 64>;
+using ThreadblockShape = cutlass::gemm::GemmShape<32, 256, 64>;
 // Number of pipelines you want to use
 constexpr int NumStages = 3;
 constexpr int NumSplitK = 8;
 
-using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, WarpShape, NumSplitK, NumStages>;
+using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, NumSplitK, NumStages>;
 using Args = typename TestKernel::Params;
 
 int run(Options &options) {
@@ -206,8 +206,10 @@ int run(Options &options) {
 
   const int weights_rows = problem_size.k();
   const int weights_cols = problem_size.n();
-  const int packed_weights_cols = weights_cols;
-  const int packed_weights_rows = (weights_rows + 1) / 2;
+
+  // q4 weights 16x16 tile is packed into 128B vector on the k dimension
+  const int packed_weights_cols = weights_cols / 16;
+  const int packed_weights_rows = weights_rows * (128 / 16);
   const int meta_rows = (weights_rows / QuantBlocking::kRow);
   const int meta_cols = (weights_cols / QuantBlocking::kColumn);
 
@@ -231,7 +233,7 @@ int run(Options &options) {
 
   Args args(problem_size, tensor_d.device_data(), tensor_d.stride(0) * sizeof(cutlass::half_t),
     tensor_a.device_data(), tensor_a.stride(0) * sizeof(cutlass::half_t),
-    q4_weights.device_data(), problem_size.k(),
+    q4_weights.device_data(), q4_weights.stride(0) * sizeof(uint8_t),
     scales.device_data(), scales.stride(0) * sizeof(cutlass::half_t));
 
   cutlass::Status status = TestKernel::can_implement(args);
@@ -241,7 +243,7 @@ int run(Options &options) {
   }
 
   dim3 grid(args.grid_tiled_shape_.m(), args.grid_tiled_shape_.n(), args.grid_tiled_shape_.k());
-  dim3 block(TestKernel::kThreadCount, 1, 1);
+  dim3 block(TestKernel::kThreads, 1, 1);
   std::cout << "Launching kernel with grid " << grid.x << "x" << grid.y << "x" << grid.z << " and block " << block.x << "x" << block.y << "x" << block.z << std::endl;
 
   cudaError_t cuda_err;
