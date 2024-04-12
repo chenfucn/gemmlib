@@ -591,16 +591,75 @@ struct QuantB4Gemm {
   
     // Store partial result to shared memory
     float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.shared_Acc[warp_k_idx].data());
-    CUTLASS_PRAGMA_UNROLL
-    for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-      const int m = div_power2<4>(lane_idx) + m_tile * 8;  // assuming no m split among warps
+
+    // With a single store, each warp writes a tile of (8x8) floats to shared memory,
+    // causing bank conflict, as all element (m,0) m = 0~7 are stored in the same bank.
+    // To avoid this, for different row, we shift the write position by 0, 1, 2, 3.
+    // The following 4 loops are almost identical except the n_tile_offset shift.
+    // But combining them into one loop seems to confuse the compiler, causing
+    // the accumulators to be stored in local memory instead of registers.
+    const int lane_m_idx = div_power2<4>(lane_idx);
+    switch (lane_m_idx % 4)
+    {
+    case 0:
       CUTLASS_PRAGMA_UNROLL
-      for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-        const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile * 8;
-        const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
-        *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+        CUTLASS_PRAGMA_UNROLL
+        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile * 8;
+          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
+          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
+        }
       }
+      break;
+
+    case 1:
+      CUTLASS_PRAGMA_UNROLL
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+        CUTLASS_PRAGMA_UNROLL
+        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+          const int n_tile_offset = (n_tile + 1) % (WarpShape::kN / 8);
+          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
+          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
+          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
+        }
+      }
+      break;    
+
+    case 2:
+      CUTLASS_PRAGMA_UNROLL
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+        CUTLASS_PRAGMA_UNROLL
+        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+          const int n_tile_offset = (n_tile + 2) % (WarpShape::kN / 8);
+          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
+          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
+          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
+        }
+      }
+      break;
+
+    case 3:
+      CUTLASS_PRAGMA_UNROLL
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+        CUTLASS_PRAGMA_UNROLL
+        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+          const int n_tile_offset = (n_tile + 3) % (WarpShape::kN / 8);
+          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
+          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
+          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
+        }
+      }
+      break;
+
+    default:
+      break;
     }
+
 
     if constexpr (kKWarps > 1) {
       __syncthreads();
@@ -624,16 +683,16 @@ struct QuantB4Gemm {
         const int col_idx = n * (4 * 32) + lane_idx * 4;
         const int offset = row_idx * ThreadblockShape::kN + col_idx;
         for (int k = 0; k < kKWarps; ++k) {
+          cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.shared_Acc[k].data() + offset);
           if (k == 0) {
-            other_acc[m][n][0].x = shared_storage.shared_Acc[k].data()[offset + 0];
-            other_acc[m][n][0].y = shared_storage.shared_Acc[k].data()[offset + 1];
-            other_acc[m][n][1].x = shared_storage.shared_Acc[k].data()[offset + 2];
-            other_acc[m][n][1].y = shared_storage.shared_Acc[k].data()[offset + 3];
+            other_acc[m][n] = *smem_ptr;
           } else {
-            other_acc[m][n][0].x += shared_storage.shared_Acc[k].data()[offset + 0];
-            other_acc[m][n][0].y += shared_storage.shared_Acc[k].data()[offset + 1];
-            other_acc[m][n][1].x += shared_storage.shared_Acc[k].data()[offset + 2];
-            other_acc[m][n][1].y += shared_storage.shared_Acc[k].data()[offset + 3];
+            cutlass::Array<float2, 2> tmp;
+            tmp = *smem_ptr;
+            other_acc[m][n][0].x += tmp[0].x;
+            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, tmp[0].y);
+            other_acc[m][n][1].x += tmp[1].x;
+            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, tmp[1].y);
           }
         }
       }
@@ -641,6 +700,7 @@ struct QuantB4Gemm {
 
     // Store the thread block result to global memory
     using half4 = cutlass::Array<__half2, 2>;
+    static_assert(sizeof(half4) == sizeof(uint64_t));
     auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
     int output_stride = params.output_byte_stride_ / sizeof(ElementT);
     const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
@@ -659,8 +719,8 @@ struct QuantB4Gemm {
           half4 tmp;
           tmp[0] = __float22half2_rn(other_acc[m][n][0]);
           tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-          half4* dst_ptr = reinterpret_cast<half4*>(output_ptr + row_idx * output_stride + col_idx);
-          *dst_ptr = tmp;
+          uint64_t* dst_ptr = reinterpret_cast<uint64_t*>(output_ptr + row_idx * output_stride + col_idx);
+          *dst_ptr = *reinterpret_cast<uint64_t*>(&tmp);
         }
       }
     }
