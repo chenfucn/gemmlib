@@ -113,10 +113,9 @@ struct QuantB4Gemm {
   union SharedStorage {
     MmaSharedStorage main_loop;
 
-    /// End of mma loop, warps in the same n warp group need
+    /// End of mma loop, warps from different k group need
     /// to add their accumulators together
-    static constexpr int kAccSizePerWarp = WarpShape::kM * WarpShape::kN;
-    cutlass::AlignedBuffer<float, kAccSizePerWarp> shared_Acc[kNWarps][kKWarps - 1];
+    cutlass::AlignedBuffer<float, ThreadblockShape::kM * ThreadblockShape::kN> shared_Acc[kKWarps];
   };
 
   // Fragments for operand A and dequantized B
@@ -590,19 +589,16 @@ struct QuantB4Gemm {
     // ========================== Finish the main loop ==========================
     // !!!!! SHOULD NOT ACCESS main_loop SHARED MEMORY AFTER THIS POINT !!!!!
   
-    // Finished the main loop, now each warp (except warp 0) stores the partial results
-    // to shared memory. Later warp 0 should gather them to form the final result
-    using Float4 = cutlass::Array<float, 4>;  // hopefully utilize 128b st.shared.b128
-    constexpr int kAccLoads = MmaOp::FragmentC::kElements / 4;
-    static_assert(kAccLoads * 4 == MmaOp::FragmentC::kElements);
-    if (warp_k_idx != 0){
-      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc[warp_n_idx][warp_k_idx - 1].data());
-      d_smem_ptr += lane_idx;
-      Float4* f4s = reinterpret_cast<Float4*>(accumulators.data());
+    // Store partial result to shared memory
+    float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.shared_Acc[warp_k_idx].data());
+    CUTLASS_PRAGMA_UNROLL
+    for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+      const int m = div_power2<4>(lane_idx) + m_tile * 8;  // assuming no m split among warps
       CUTLASS_PRAGMA_UNROLL
-      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l) {
-        d_smem_ptr[0] = f4s[acc_l];
-        d_smem_ptr += 32;
+      for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+        const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile * 8;
+        const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
+        *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
       }
     }
 
@@ -610,78 +606,64 @@ struct QuantB4Gemm {
       __syncthreads();
     }
 
-    if (warp_k_idx != 0) {
-      return;
+    // ========================== Warp reduction ==========================
+    // Loading TB::kM x TB::kN row major from shared memory.
+    // Each smem load 16 bytes, i.e. 4 floats. Each warp loads 4 x 32 = 128
+    // floats.
+    static_assert(ThreadblockShape::kN >= (4 * 32)); // make math simpler
+    constexpr int kAccLoadsN = ThreadblockShape::kN / (4 * 32);
+    static_assert(ThreadblockShape::kM % kWarps == 0);
+    constexpr int kAccLoadsM = ThreadblockShape::kM / kWarps;
+
+    cutlass::Array<float2, 2> other_acc[kAccLoadsM][kAccLoadsN];
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < kAccLoadsM; ++m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < kAccLoadsN; ++n) {
+        const int row_idx = m * kWarps + warp_idx;
+        const int col_idx = n * (4 * 32) + lane_idx * 4;
+        const int offset = row_idx * ThreadblockShape::kN + col_idx;
+        for (int k = 0; k < kKWarps; ++k) {
+          if (k == 0) {
+            other_acc[m][n][0].x = shared_storage.shared_Acc[k].data()[offset + 0];
+            other_acc[m][n][0].y = shared_storage.shared_Acc[k].data()[offset + 1];
+            other_acc[m][n][1].x = shared_storage.shared_Acc[k].data()[offset + 2];
+            other_acc[m][n][1].y = shared_storage.shared_Acc[k].data()[offset + 3];
+          } else {
+            other_acc[m][n][0].x += shared_storage.shared_Acc[k].data()[offset + 0];
+            other_acc[m][n][0].y += shared_storage.shared_Acc[k].data()[offset + 1];
+            other_acc[m][n][1].x += shared_storage.shared_Acc[k].data()[offset + 2];
+            other_acc[m][n][1].y += shared_storage.shared_Acc[k].data()[offset + 3];
+          }
+        }
+      }
     }
 
-    //
-    // Only warp k = 0 gathers the result from all other warps and stores it to global memory
-    // Be extra careful with synchronization code below, as only a subset of threads
-    // are active!
-    //
-    Float4 other_acc[2];
-    int double_buffer_idx = 0;
-    int frag_idx = 0;
+    // Store the thread block result to global memory
+    using half4 = cutlass::Array<__half2, 2>;
+    auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
+    int output_stride = params.output_byte_stride_ / sizeof(ElementT);
+    const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
+    const int tb_m_end = min(params.problem_size_.m(), mul_power2<ThreadblockShape::kM>(blockIdx.x + 1));
+    const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
+    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));  
 
     CUTLASS_PRAGMA_UNROLL
-    for (int warp = 1; warp < kKWarps; ++warp) {
-      Float4* d_smem_ptr = reinterpret_cast<Float4*>(shared_storage.shared_Acc[warp_n_idx][warp - 1].data()) + lane_idx;
-
-      if constexpr (kDebugPrintC) {
-        if (lane_idx == 0) {
-          printf("======= C gatered from warp %d =======\n", warp);
-        }
-      }
-
+    for (int m = 0; m < kAccLoadsM; ++m) {
       CUTLASS_PRAGMA_UNROLL
-      for (int acc_l = 0; acc_l < kAccLoads; ++acc_l, double_buffer_idx ^= 1) {
-        other_acc[double_buffer_idx] = d_smem_ptr[0];
-        d_smem_ptr += 32;
-
-        if constexpr (kDebugPrintC) {
-          const char* const format = (lane_idx == 31) ? "%f, %f\n\n" : ((lane_idx % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          printf(format, float(other_acc[double_buffer_idx][0]), float(other_acc[double_buffer_idx][1]));
-          printf(format, float(other_acc[double_buffer_idx][2]), float(other_acc[double_buffer_idx][3]));
-        }
-
-        if (warp == 1 && acc_l == 0) {
-          continue;
-        }
-
-        const int read_idx = double_buffer_idx ^ 1;
-        accumulators[frag_idx + 0] += other_acc[read_idx][0];
-        accumulators[frag_idx + 1] += other_acc[read_idx][1];
-        accumulators[frag_idx + 2] += other_acc[read_idx][2];
-        accumulators[frag_idx + 3] += other_acc[read_idx][3];
-        frag_idx += 4;
-        frag_idx = frag_idx % MmaOp::FragmentC::kElements;
-      }
-    }
-    {
-      const int read_idx = double_buffer_idx ^ 1;
-      accumulators[frag_idx + 0] += other_acc[read_idx][0];
-      accumulators[frag_idx + 1] += other_acc[read_idx][1];
-      accumulators[frag_idx + 2] += other_acc[read_idx][2];
-      accumulators[frag_idx + 3] += other_acc[read_idx][3];
-    }
-
-    // Store the result
-    __half2* output_ptr = reinterpret_cast<__half2*>(params.ptr_output_);
-    int output_stride = params.output_byte_stride_ / sizeof(__half2);
-    const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data());
-
-    int n = n_start + (mod_power2<4>(lane_idx) << 1);
-    CUTLASS_PRAGMA_UNROLL
-    for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile, n += 8) {
-      int m = m_start + div_power2<4>(lane_idx);
-      CUTLASS_PRAGMA_UNROLL
-      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile, m += 8, ++c_ptr) {
-        if (n < n_end && m < m_end) {
-          *(output_ptr + m * output_stride + n/2) = __float22half2_rn(c_ptr[0]);
+      for (int n = 0; n < kAccLoadsN; ++n) {
+        const int row_idx = tb_m_start + m * kWarps + warp_idx;
+        const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+        if (row_idx < tb_m_end && col_idx < tb_n_end) {
+          // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+          half4 tmp;
+          tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+          tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+          half4* dst_ptr = reinterpret_cast<half4*>(output_ptr + row_idx * output_stride + col_idx);
+          *dst_ptr = tmp;
         }
       }
     }
-
   }
 };
 
