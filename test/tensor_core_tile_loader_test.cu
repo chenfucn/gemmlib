@@ -547,7 +547,9 @@ void test_load_packed_b(int m, int n, int k) {
 
 TEST(TensorCoreLoader, PackedBTest) {
   test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 256, 64>, 4, 3>(1, 512 - 32, 64 * 20 + 32);
-  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 128, 64>, 4, 3>(1, 128 + 32, 64 * 22 - 32);
+  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 128, 64>, 4, 3>(1, 128 + 32, 64 * 22 - 32);
+  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 256, 64>, 4, 3>(1, 512 - 64, 64 * 20 + 16);
+  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 128, 64>, 4, 3>(1, 512 + 32, 64 * 22 - 32);
 
   // test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
   // test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);

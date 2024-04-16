@@ -28,13 +28,22 @@ namespace warp {
  *        WarpShape::kM is ignored, using kN and kK to specify B dimension only.
 */
 template <typename WarpShape_, int TBStrideK_>
-class TensorCoreTileLoader {
+class TensorCoreTileLoader;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Specialization for ?x64x? tiles. kDimM is ignored.
+template <
+    int kDimM_,
+    int kDimK_,
+    int TBStrideK_>
+class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrideK_> {
  public:
-  using WarpShape = WarpShape_;
+  static constexpr int kDimM = kDimM_;
   static constexpr int kDimN = 64;
+  static constexpr int kDimK = kDimK_;
+  using WarpShape = cutlass::gemm::GemmShape<kDimM, kDimN, kDimK>;
   static constexpr int kThreadBlockStrideK = TBStrideK_;
   static_assert(WarpShape::kK % 16 == 0); // packing restriction
-  static_assert(WarpShape::kN == kDimN); // temp implementation restriction
   static_assert(kThreadBlockStrideK % WarpShape::kK == 0);
 
   // Q4 matrix is column major. Each 16x16 fp16 block is quantized
