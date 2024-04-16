@@ -29,6 +29,94 @@ namespace mickey {
 namespace gemm {
 namespace kernel {
 
+using b64 = unsigned long long;
+static_assert(sizeof(b64) == 8, "b64 should be 64 bits");
+
+struct SeqLock {
+  static constexpr uint32_t kUnlocked = 0xa7b6c536;
+  static constexpr uint32_t kLocked = kUnlocked + 1;
+  static constexpr uint32_t kSeqStart = kUnlocked + 2;
+  static constexpr b64 kInit = b64(kSeqStart) << 32 | kUnlocked;
+
+  const uint32_t max_k_;  // max number of competing threads
+  uint32_t count_{kSeqStart - 2};     // sequence number
+  b64* address_;
+
+  CUTLASS_DEVICE
+  SeqLock(b64* address, uint32_t max_k) : address_(address), max_k_(max_k) {}
+
+  CUTLASS_DEVICE
+  bool locked() const {
+    return count_ - kSeqStart < max_k_;
+  }
+
+  CUTLASS_DEVICE
+  static bool valid(b64 val, uint32_t max_k) {
+    uint32_t lock = val & 0xffffffff;
+    uint32_t cnt = val >> 32;
+    return ((lock - kUnlocked) < 2) && ((cnt - kSeqStart) < max_k);
+  }
+
+  CUTLASS_DEVICE
+  uint32_t lock() {
+    assert(!locked());
+
+    // We use an 64b uninitialized memory location to store the lock.
+    // There are 2 * max_k_ valid values among 2^64 possible ones.
+    // This implementation considers the chance of uninitialized memory
+    // to be valid is negligible.
+    b64 fetched = *reinterpret_cast<b64*>(address_);
+    if (!valid(fetched, max_k_)) {
+      // Unintialized memory, attempt to initialize it
+      auto old = atomicCAS(reinterpret_cast<b64*>(address_), fetched, kInit);
+      if (old != fetched) {
+        // Another thread has initialized it
+        fetched = old;
+      } else {
+        // Successfully initialized
+        fetched = kInit;
+      }
+    }
+
+    if (!valid(fetched, max_k_)) {
+      printf("Block(%d, %d, %d) Invalid %p, fetched  %llx\n",
+          blockIdx.x, blockIdx.y, blockIdx.z, address_, fetched);
+      assert(false);
+    }
+
+    uint32_t old_lock_val;
+    int spin_cnt = 0;
+    do {
+      if (spin_cnt++ > 1000) {
+        // spin_cnt is used to avoid infinite loop
+        // if the lock is not released by the owner
+        printf("Spin count %d, fetched %llx\n", spin_cnt, fetched);
+        assert(spin_cnt < 1000);
+      }
+      old_lock_val = atomicCAS(reinterpret_cast<uint32_t*>(address_), kUnlocked, kLocked);
+    } while (old_lock_val != kUnlocked);
+
+    count_ = address_[0] >> 32;
+    assert(locked());
+    return count_ - kSeqStart;
+  }
+
+  CUTLASS_DEVICE
+  void unlock() {
+    assert(locked());
+    b64 unlocked = kUnlocked | (b64(count_ + 1) << 32); 
+    b64 old = atomicExch(address_, unlocked);
+    assert((old & 0xffffffff) == kLocked && old >> 32 == count_);
+    count_ = kSeqStart - 1;
+  }
+
+  CUTLASS_DEVICE
+  void clear() {
+    *address_ = kInit;
+  }
+
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -110,12 +198,16 @@ struct QuantB4Gemm {
     cutlass::AlignedBuffer<ElementT, kMetaSize> shared_Scale[kWarps];
   };
 
-  union SharedStorage {
-    MmaSharedStorage main_loop;
-
+  struct AccSharedStorage {
     /// End of mma loop, warps from different k group need
     /// to add their accumulators together
     cutlass::AlignedBuffer<float, ThreadblockShape::kM * ThreadblockShape::kN> shared_Acc[kKWarps];
+    uint32_t block_k_reduction_id[1];
+  };
+
+  union SharedStorage {
+    MmaSharedStorage main_loop;
+    AccSharedStorage posfix;
   };
 
   // Fragments for operand A and dequantized B
@@ -174,6 +266,7 @@ struct QuantB4Gemm {
     void const * const ptr_offsets_;
     const int offsets_byte_stride_;
     int gemm_k_size_{0};
+    b64* split_k_locks_{nullptr};
 
     CUTLASS_HOST_DEVICE
     Params() { }
@@ -209,6 +302,17 @@ struct QuantB4Gemm {
         mickey::div_up(problem_size.m(), ThreadblockShape::kM),
         mickey::div_up(problem_size.n(), ThreadblockShape::kN),
         kSplitK)) { }
+
+    CUTLASS_HOST_DEVICE
+    size_t workspace_size() const {
+      return grid_tiled_shape_.k() == 1 ? 0
+             : sizeof(b64) * grid_tiled_shape_.m() * grid_tiled_shape_.n();
+    }
+
+    CUTLASS_HOST_DEVICE
+    void set_workspace(void* workspace) {
+      split_k_locks_ = reinterpret_cast<b64*>(workspace);
+    }
   };
 
   //
@@ -313,6 +417,10 @@ struct QuantB4Gemm {
         printf("CTA out of range %d, %d, %d\n", blockIdx.x, blockIdx.y, blockIdx.z);
       }
       return;
+    }
+
+    if (params.grid_tiled_shape_.k() > 1){
+      assert(params.split_k_locks_ != nullptr);
     }
 
     //
@@ -590,7 +698,7 @@ struct QuantB4Gemm {
     // !!!!! SHOULD NOT ACCESS main_loop SHARED MEMORY AFTER THIS POINT !!!!!
   
     // Store partial result to shared memory
-    float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.shared_Acc[warp_k_idx].data());
+    float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.posfix.shared_Acc[warp_k_idx].data());
 
     // With a single store, each warp writes a tile of (8x8) floats to shared memory,
     // causing bank conflict, as all element (m,0) m = 0~7 are stored in the same bank.
@@ -683,7 +791,7 @@ struct QuantB4Gemm {
         const int col_idx = n * (4 * 32) + lane_idx * 4;
         const int offset = row_idx * ThreadblockShape::kN + col_idx;
         for (int k = 0; k < kKWarps; ++k) {
-          cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.shared_Acc[k].data() + offset);
+          cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.posfix.shared_Acc[k].data() + offset);
           if (k == 0) {
             other_acc[m][n] = *smem_ptr;
           } else {
@@ -698,9 +806,24 @@ struct QuantB4Gemm {
       }
     }
 
-    // Store the thread block result to global memory
+    // ========================== Store to global memory ==========================
+    const int lock_offset = blockIdx.x * gridDim.y + blockIdx.y;
+    SeqLock seq_lock(params.split_k_locks_ + lock_offset, params.grid_tiled_shape_.k());
+
+    uint32_t k_seq = 0;
+    if (params.grid_tiled_shape_.k() > 1) {
+      if (threadIdx.x == kThreads - 1) {
+        auto seq = seq_lock.lock();
+        printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
+        shared_storage.posfix.block_k_reduction_id[0] = seq;
+      }
+      __syncthreads();
+      k_seq = shared_storage.posfix.block_k_reduction_id[0];
+    }
+
+
     using half4 = cutlass::Array<__half2, 2>;
-    static_assert(sizeof(half4) == sizeof(uint64_t));
+    static_assert(sizeof(half4) == sizeof(b64));
     auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
     int output_stride = params.output_byte_stride_ / sizeof(ElementT);
     const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
@@ -708,19 +831,55 @@ struct QuantB4Gemm {
     const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
     const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));  
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < kAccLoadsM; ++m) {
+    if (threadIdx.x == 0)
+        printf("(%d, %d, %d) seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, k_seq);
+
+    if (k_seq == 0) {
       CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < kAccLoadsN; ++n) {
-        const int row_idx = tb_m_start + m * kWarps + warp_idx;
-        const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
-        if (row_idx < tb_m_end && col_idx < tb_n_end) {
-          // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-          half4 tmp;
-          tmp[0] = __float22half2_rn(other_acc[m][n][0]);
-          tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-          uint64_t* dst_ptr = reinterpret_cast<uint64_t*>(output_ptr + row_idx * output_stride + col_idx);
-          *dst_ptr = *reinterpret_cast<uint64_t*>(&tmp);
+      for (int m = 0; m < kAccLoadsM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < kAccLoadsN; ++n) {
+          const int row_idx = tb_m_start + m * kWarps + warp_idx;
+          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+          if (row_idx < tb_m_end && col_idx < tb_n_end) {
+            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+            half4 tmp;
+            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
+            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+          }
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < kAccLoadsM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < kAccLoadsN; ++n) {
+          const int row_idx = tb_m_start + m * kWarps + warp_idx;
+          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+          if (row_idx < tb_m_end && col_idx < tb_n_end) {
+            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
+            half4 src;
+            *reinterpret_cast<b64*>(&src) = *dst_ptr;
+            half4 tmp;
+            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+            tmp[0] = __hadd2(src[0], tmp[0]);
+            tmp[1] = __hadd2(src[1], tmp[1]);
+            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+          }
+        }
+      }
+    }
+
+    if (params.grid_tiled_shape_.k() > 1) {
+      __syncthreads();
+      if (threadIdx.x == kThreads - 1) {
+        seq_lock.unlock();
+        if (k_seq == params.grid_tiled_shape_.k() - 1) {
+          seq_lock.clear();
         }
       }
     }

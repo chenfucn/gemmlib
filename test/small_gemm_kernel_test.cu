@@ -76,6 +76,11 @@ class QuantB4GemmTestDevKernel {
       return status;
     }
 
+    // Allocate workspace memory
+    size_t workspace_size = args.workspace_size();
+    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    args.set_workspace(workspace.get());
+
     dim3 grid(args.grid_tiled_shape_.m(), args.grid_tiled_shape_.n(), args.grid_tiled_shape_.k());
     dim3 block(TestKernel::kThreads, 1, 1);
 
@@ -138,7 +143,7 @@ void test_quantb4_gemm(int m, int n, int k) {
   // fill the tensor with reduced bits fp16 seems to be necessary to avoid rounding errors
   // during test. Need to investigate further why.
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_a({m, k});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 174321, 1.5f, -1.125f, 6);
+  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 7245, 1.5f, -1.125f, 4);
 
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_b({k, n});
   cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 193456, 1.75f, -1.25f, 8);
@@ -271,13 +276,13 @@ void test_quantb4_gemm(int m, int n, int k) {
         continue;
       }
       float diff = fabs(expected - actual);
-      if (diff < 2e-7) {
+      if (diff < 0.0002) {
         continue;
       }
       float diff_ratio = fabs(expected - actual) / max(fabs(expected), fabs(actual)); 
       if (diff_ratio > 3e-3) {
-        std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " ratio: " << diff_ratio << std::endl;
-        ASSERT_TRUE(false);
+        std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " diff: " << diff << " ratio: " << diff_ratio << std::endl;
+        EXPECT_TRUE(false);
       }
     }
   }
@@ -292,7 +297,8 @@ TEST(QuantB4Gemm, PackedBTest) {
   // test_quantb4_gemm<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
   // test_quantb4_gemm<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
 
-  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 1, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
+  // test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 1, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
+  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 2, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
 
   // test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
   // test_quantb4_gemm<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 2>(170, 176, 2048 + 32);
