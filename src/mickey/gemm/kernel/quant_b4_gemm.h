@@ -266,7 +266,7 @@ struct QuantB4Gemm {
     void const * const ptr_offsets_;
     const int offsets_byte_stride_;
     int gemm_k_size_{0};
-    b64* split_k_locks_{nullptr};
+    uint8_t* workspace_{nullptr};
 
     CUTLASS_HOST_DEVICE
     Params() { }
@@ -305,13 +305,15 @@ struct QuantB4Gemm {
 
     CUTLASS_HOST_DEVICE
     size_t workspace_size() const {
+      int mm = grid_tiled_shape_.m() * ThreadblockShape::kM;
+      int nn = grid_tiled_shape_.n() * ThreadblockShape::kN;
       return grid_tiled_shape_.k() == 1 ? 0
-             : sizeof(b64) * grid_tiled_shape_.m() * grid_tiled_shape_.n();
+             : sizeof(b64) * grid_tiled_shape_.m() * grid_tiled_shape_.n() + mm * nn * sizeof(float);
     }
 
     CUTLASS_HOST_DEVICE
     void set_workspace(void* workspace) {
-      split_k_locks_ = reinterpret_cast<b64*>(workspace);
+      workspace_ = reinterpret_cast<uint8_t*>(workspace);
     }
   };
 
@@ -420,7 +422,7 @@ struct QuantB4Gemm {
     }
 
     if (params.grid_tiled_shape_.k() > 1){
-      assert(params.split_k_locks_ != nullptr);
+      assert(params.workspace_ != nullptr);
     }
 
     //
@@ -808,7 +810,13 @@ struct QuantB4Gemm {
 
     // ========================== Store to global memory ==========================
     const int lock_offset = blockIdx.x * gridDim.y + blockIdx.y;
-    SeqLock seq_lock(params.split_k_locks_ + lock_offset, params.grid_tiled_shape_.k());
+    int mm = gridDim.x * ThreadblockShape::kM;
+    int nn = gridDim.y * ThreadblockShape::kN;
+    // if (threadIdx.x == 0)
+    //   printf("Workspace size %d, %d\n", mm, nn);
+    auto* split_k_locks = reinterpret_cast<b64*>(params.workspace_ + mm * nn * sizeof(float));
+
+    SeqLock seq_lock(split_k_locks + lock_offset, params.grid_tiled_shape_.k());
 
     uint32_t k_seq = 0;
     if (params.grid_tiled_shape_.k() > 1) {
@@ -829,7 +837,9 @@ struct QuantB4Gemm {
     const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
     const int tb_m_end = min(params.problem_size_.m(), mul_power2<ThreadblockShape::kM>(blockIdx.x + 1));
     const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
-    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));  
+    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));
+
+    float* red_buf = reinterpret_cast<float*>(params.workspace_);
 
     // if (threadIdx.x == 0)
     //     printf("(%d, %d, %d) seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, k_seq);
@@ -843,10 +853,32 @@ struct QuantB4Gemm {
           const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
           if (row_idx < tb_m_end && col_idx < tb_n_end) {
             // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+            float* dst = red_buf + row_idx * nn + col_idx;
+            *reinterpret_cast<cutlass::Array<float2, 2>*>(dst) = other_acc[m][n];
+          }
+        }
+      }
+    } else if (k_seq == params.grid_tiled_shape_.k() - 1){
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < kAccLoadsM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < kAccLoadsN; ++n) {
+          const int row_idx = tb_m_start + m * kWarps + warp_idx;
+          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+          if (row_idx < tb_m_end && col_idx < tb_n_end) {
+            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+            auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * nn + col_idx);
+            cutlass::Array<float2, 2> partial = *partial_ptr;
+            other_acc[m][n][0].x += partial[0].x;
+            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
+            other_acc[m][n][1].x += partial[1].x;
+            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
+
+
+            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
             half4 tmp;
             tmp[0] = __float22half2_rn(other_acc[m][n][0]);
             tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
             *dst_ptr = *reinterpret_cast<b64*>(&tmp);
           }
         }
@@ -860,15 +892,13 @@ struct QuantB4Gemm {
           const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
           if (row_idx < tb_m_end && col_idx < tb_n_end) {
             // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
-            half4 src;
-            *reinterpret_cast<b64*>(&src) = *dst_ptr;
-            half4 tmp;
-            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
-            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-            tmp[0] = __hadd2(src[0], tmp[0]);
-            tmp[1] = __hadd2(src[1], tmp[1]);
-            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+            auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * nn + col_idx);
+            cutlass::Array<float2, 2> partial = *partial_ptr;
+            other_acc[m][n][0].x += partial[0].x;
+            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
+            other_acc[m][n][1].x += partial[1].x;
+            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
+            *partial_ptr = other_acc[m][n];
           }
         }
       }
