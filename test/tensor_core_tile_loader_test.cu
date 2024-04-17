@@ -66,10 +66,15 @@ struct LoadPackedBTestKernel {
   static constexpr int kElementSize = 2;
   static_assert(kElementSize == sizeof(ElementT), "Only support 16b float now");
 
-  static_assert(TBShape::kN % 64 == 0); // 4 tiles to fully utilize ldmatrix inst
-  static_assert(TBShape::kK % 16 == 0); // int4 unit tile is 16x16
+  static_assert(
+    (TBShape::kN == 16 && TBShape::kK == 64)  // smallest tile size for GEMV
+    ||  ((TBShape::kN % 64 == 0)              // 4 tiles to fully utilize ldmatrix inst
+      && (TBShape::kK % 16 == 0))             // int4 unit tile is 16x16
+  );
 
-  using WarpBShape = cutlass::gemm::GemmShape<1, 64, 32>; // TODO!! test 1, 64, 16 too
+  using WarpBShape = typename std::conditional<TBShape::kN == 16,
+      cutlass::gemm::GemmShape<1, 16, 64>,     // smallest tile for GEMV
+      cutlass::gemm::GemmShape<1, 64, 32>>::type;     // TODO!! test 1, 64, 16 too
   using PackedBLoader = mickey::gemm::warp::TensorCoreTileLoader<WarpBShape, TBShape::kK>;
   using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpBShape, ElementT, false>;
 
@@ -85,6 +90,7 @@ struct LoadPackedBTestKernel {
   static constexpr int kMmaIterations = TBShape::kK / InstructionShape::kK;
   static constexpr int kWarpMmaIterations = kMmaIterations / kKWarps;
   static_assert(kWarpMmaIterations == 1 || kWarpMmaIterations == 2 || kWarpMmaIterations == 4);
+  static_assert(PackedBLoader::kKBlksPerLoad == 1 || PackedBLoader::kKBlksPerLoad == kMmaIterations);
 
   /// Parameters structure
   struct Params {
@@ -344,10 +350,16 @@ struct LoadPackedBTestKernel {
       packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
       ++packed_b_loader;
 
+      if constexpr(PackedBLoader::kKBlksPerLoad == kWarpMmaIterations) {
+          PackedBLoader::load_to_register(lane_idx, 0, packed_b_smem_read_ptr, fragment_packed_b);
+      }
+
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
       for (int mma_iter = 0; mma_iter < kWarpMmaIterations; ++mma_iter)  {
-        PackedBLoader::load_to_register(lane_idx, mma_iter, packed_b_smem_read_ptr, fragment_packed_b);
+        if constexpr(PackedBLoader::kKBlksPerLoad == 1) {
+          PackedBLoader::load_to_register(lane_idx, mma_iter, packed_b_smem_read_ptr, fragment_packed_b);
+        }
 
         meta_loader.dequant_k16(mma_iter, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
         CUTLASS_PRAGMA_UNROLL
@@ -551,10 +563,10 @@ TEST(TensorCoreLoader, PackedBTest) {
   test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 256, 64>, 4, 3>(1, 512 - 64, 64 * 20 + 16);
   test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 128, 64>, 4, 3>(1, 512 + 32, 64 * 22 - 32);
 
-  // test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
-  // test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
-  // test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
+  test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
+  test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
 
   // test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
   // test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);

@@ -70,6 +70,7 @@ add_executable(ms_blkq4gemm_test
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_util.cu
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_quant_sm80_test.cu
   ${PROJECT_SOURCE_DIR}/test/blkq4_fp16_gemm_sm80_test.cu
+  ${PROJECT_SOURCE_DIR}/test/gemv_kernel_test.cu
   ${PROJECT_SOURCE_DIR}/test/small_gemm_kernel_test.cu
   ${PROJECT_SOURCE_DIR}/test/tensor_core_tile_loader_test.cu
   ${PROJECT_SOURCE_DIR}/test/swizzle_loader_test.cu
