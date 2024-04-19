@@ -48,34 +48,25 @@ void weights2Half([[maybe_unused]] uint32_t const &weights,
   // 1.125 instruction per weight, 9 instructions in total.
 
   uint32_t*      b32s   = reinterpret_cast<uint32_t*>(dest.data());
-  half2*         pairs  = reinterpret_cast<half2*>(dest.data());
   const uint32_t high_8s = weights >> 8;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 500))
   asm volatile(
-    "  lop3.b32      %0, %4, 0x000f000f, 0x64006400, 0xea;\n"
-    "  lop3.b32      %1, %4, 0x00f000f0, 0x54005400, 0xea;\n"
-    "  lop3.b32      %2, %5, 0x000f000f, 0x64006400, 0xea;\n"
-    "  lop3.b32      %3, %5, 0x00f000f0, 0x54005400, 0xea;\n"
+    "  lop3.b32      %0, %4, 0x000f000f, %6, 0xea;\n"
+    "  lop3.b32      %1, %4, 0x00f000f0, %7, 0xea;\n"
+    "  lop3.b32      %2, %5, 0x000f000f, %6, 0xea;\n"
+    "  lop3.b32      %3, %5, 0x00f000f0, %7, 0xea;\n"
+    "  sub.rn.f16x2  %0, %0, %6;\n"         // q_w - 1024.0
+    "  fma.rn.f16x2  %1, %1, %8, %9;\n"     // 1.0 * q_w + (-64.0)
+    "  sub.rn.f16x2  %2, %2, %6;\n"
+    "  fma.rn.f16x2  %3, %3, %8, %9;\n"
     : "=r"(b32s[0]), "=r"(b32s[1]), "=r"(b32s[2]), "=r"(b32s[3])
-    : "r"(weights), "r"(high_8s));
+    : "r"(weights), "r"(high_8s),
+      "r"(0x64006400), "r"(0x54005400)
+      "r"(0x3c003c00), "r"(0xd400d400));
 #else
   assert(false);
 #endif
-
-  constexpr __half_raw kKilo{0x6400};
-  constexpr half2 onek(kKilo, kKilo);
-  //1.0: 3c00, -64.0: d400
-  constexpr __half_raw k1{0x3c00};
-  constexpr half2 one(k1, k1);
-
-  constexpr __half_raw k64{0xd400};
-  constexpr half2 sixtyfour{k64, k64};
-
-  pairs[0] = __hsub2(pairs[0], onek);
-  pairs[1] = __hfma2(pairs[1], one, sixtyfour);
-  pairs[2] = __hsub2(pairs[2], onek);
-  pairs[3] = __hfma2(pairs[3], one, sixtyfour);
 }
 
 template <int N>
@@ -83,15 +74,13 @@ CUTLASS_DEVICE
 void compute_addon(cutlass::Array<cutlass::half_t, N> const &frag_scales,
                    cutlass::Array<cutlass::half_t, N> &frag_addon) {
   static_assert(N % 2 == 0, "N must be even");
-  //half -8.0: c800
-  constexpr __half_raw kMinus8{0xc800};
-  constexpr half2 mm8(kMinus8, kMinus8);
-  const half2* scales_pair = reinterpret_cast<half2 const*>(frag_scales.data());
-  half2* addon_pair = reinterpret_cast<half2*>(frag_addon.data());
+  const auto* scales_pair = reinterpret_cast<uint32_t const*>(frag_scales.data());
+  auto* addon_pair = reinterpret_cast<uint32_t*>(frag_addon.data());
 
   CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < frag_scales.size() / 2; ++i) {
-    addon_pair[i] = __hmul2_rn(scales_pair[i], mm8);
+    // addon_pair[i] = __hmul2_rn(scales_pair[i], half2(-8.0f, -8.0f));
+    asm( "  mul.rn.f16x2 %0,%1,%2;\n" :"=r"(addon_pair[i]) : "r"(scales_pair[i]),"r"(0xc800c800));
   }
 }
 
