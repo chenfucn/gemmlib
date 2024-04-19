@@ -87,11 +87,11 @@ struct SeqLock {
     uint32_t old_lock_val;
     int spin_cnt = 0;
     do {
-      if (spin_cnt++ > 1000) {
+      if (spin_cnt++ > 2000) {
         // spin_cnt is used to avoid infinite loop
         // if the lock is not released by the owner
-        printf("Spin count %d, fetched %llx\n", spin_cnt, fetched);
-        assert(spin_cnt < 1000);
+        printf("Spin count %d, fetched %x\n", spin_cnt, old_lock_val);
+        assert(spin_cnt < 2000);
       }
       old_lock_val = atomicCAS(reinterpret_cast<uint32_t*>(address_), kUnlocked, kLocked);
     } while (old_lock_val != kUnlocked);
@@ -814,7 +814,7 @@ struct QuantB4Gemm {
     if (params.grid_tiled_shape_.k() > 1) {
       if (threadIdx.x == kThreads - 1) {
         auto seq = seq_lock.lock();
-        printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
+        // printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
         shared_storage.posfix.block_k_reduction_id[0] = seq;
       }
       __syncthreads();
@@ -831,8 +831,8 @@ struct QuantB4Gemm {
     const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
     const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));  
 
-    if (threadIdx.x == 0)
-        printf("(%d, %d, %d) seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, k_seq);
+    // if (threadIdx.x == 0)
+    //     printf("(%d, %d, %d) seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, k_seq);
 
     if (k_seq == 0) {
       CUTLASS_PRAGMA_UNROLL

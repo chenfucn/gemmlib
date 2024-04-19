@@ -190,7 +190,7 @@ using LayoutQMeta =
 using ThreadblockShape = cutlass::gemm::GemmShape<32, 256, 64>;
 // Number of pipelines you want to use
 constexpr int NumStages = 3;
-constexpr int NumSplitK = 8;
+constexpr int NumSplitK = 4;
 
 using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, NumSplitK, NumStages>;
 using Args = typename TestKernel::Params;
@@ -235,6 +235,10 @@ int run(Options &options) {
     tensor_a.device_data(), tensor_a.stride(0) * sizeof(cutlass::half_t),
     q4_weights.device_data(), q4_weights.stride(0) * sizeof(uint8_t),
     scales.device_data(), scales.stride(0) * sizeof(cutlass::half_t));
+  // Allocate workspace memory
+  size_t workspace_size = args.workspace_size();
+  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  args.set_workspace(workspace.get());
 
   cutlass::Status status = TestKernel::can_implement(args);
   if (status != cutlass::Status::kSuccess) {
