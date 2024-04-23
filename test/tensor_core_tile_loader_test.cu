@@ -86,7 +86,7 @@ struct LoadPackedBTestKernel {
   static constexpr int kB_Nloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
   static constexpr int kB_Kloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
 
-  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
+  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, has_quant_offset, false>;
 
   // Since int4 weights are packed (16x16) -> (8x8), each tile is expanded to 4 tiles when
   // de-quantized to 16b float.
@@ -164,6 +164,7 @@ struct LoadPackedBTestKernel {
     static constexpr int kMetaSizePerWarp = kMetaSizePerIter * kStages;
     static constexpr int kMetaSize = kMetaSizePerWarp * kWarps;
     cutlass::AlignedBuffer<ElementT, kMetaSize> shared_Scale;
+    cutlass::AlignedBuffer<uint8_t, has_quant_offset ? kMetaSize : 0> shared_Offset;
 
     static_assert(kMetaSizePerIter == MetaLoader::kSmemSize);
   };
@@ -292,6 +293,7 @@ struct LoadPackedBTestKernel {
 
     FragmentPackedB fragment_packed_b;
     typename MetaLoader::FragmentScales fragment_scales;
+    typename MetaLoader::FragmentOffsets fragment_offsets;
     FragmentB fragment_b;
 
     //
@@ -320,6 +322,8 @@ struct LoadPackedBTestKernel {
       lane_idx,
       params.ptr_scales_,
       params.scales_byte_stride_,
+      params.ptr_offsets_,
+      params.offsets_byte_stride_,
       n_start, n_end};
 
     if constexpr (kDebugPrint) {
@@ -337,6 +341,9 @@ struct LoadPackedBTestKernel {
       SharedStorage::kPackedBSizePerWarp * warp_idx);
 
     ElementT* shared_scale_ptr = shared_storage.shared_Scale.data() + SharedStorage::kMetaSizePerWarp * warp_idx;
+    uint8_t* shared_offset_ptr = has_quant_offset ?
+                                 shared_storage.shared_Offset.data() + SharedStorage::kMetaSizePerWarp * warp_idx
+                                  : nullptr;
 
     //
     // Prologue
@@ -345,8 +352,9 @@ struct LoadPackedBTestKernel {
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
       uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
       ElementT* scale_smem_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
+      uint8_t* offset_smem_ptr = has_quant_offset ? shared_offset_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter : nullptr;
     
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr, offset_smem_ptr);
 
       // Load packed b
       CUTLASS_PRAGMA_UNROLL
@@ -375,18 +383,17 @@ struct LoadPackedBTestKernel {
     // Mainloop
     //
     for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages, proc_k += WarpShape::kK){
-      typename MetaLoader::FragmentScales fragment_addon;
-  
       const uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr + smem_read_stage * SharedStorage::kPackedBSizePerIter;
       uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
 
       const ElementT* scale_smem_read_ptr = shared_scale_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter;
       ElementT* scale_smem_write_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
+      const uint8_t* offset_smem_read_ptr = has_quant_offset ? shared_offset_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter : nullptr;
+      uint8_t* offset_smem_write_ptr = has_quant_offset ? shared_offset_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter : nullptr;
 
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_write_ptr);
-      meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_write_ptr, offset_smem_write_ptr);
+      meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr, fragment_offsets, offset_smem_read_ptr);
 
-      meta_loader.process(fragment_scales, fragment_addon);
 
       // If PackedBLoader::kKStride > 16, then kNLoads must be 1. Because we don't want a
       // over-complicated tile visiting pattern. We always want to visit the all the
@@ -409,7 +416,7 @@ struct LoadPackedBTestKernel {
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
+        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_offsets, fragment_b);
         CUTLASS_PRAGMA_UNROLL
         for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
           int n = n_start + b_tile_n * 8 + lane_b_n_offset;
@@ -616,8 +623,8 @@ TEST(TensorCoreLoader, PackedBTest) {
   test_load_packed_b<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
   test_load_packed_b<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
 
-  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 64, 128>, 1, 4>(1, 160, 4096 + 16);
-  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 128, 128>, 1, 4>(1, 176, 4096 + 32);
+  test_load_packed_b<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 64, 64>, 1, 4>(1, 160, 4096 + 16);
+  test_load_packed_b<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 64, 64>, 1, 4>(1, 176, 4096 + 32);
 }
 
 } // namespace test

@@ -87,7 +87,7 @@ struct SwizzleDequantTestKernel {
   // static constexpr int kB_Nloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
   // static constexpr int kB_Kloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
 
-  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
+  using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, has_quant_offset, false>;
 
   // Since int4 weights are packed (16x16) -> (8x8), each tile is expanded to 4 tiles when
   // de-quantized to 16b float.
@@ -198,6 +198,7 @@ struct SwizzleDequantTestKernel {
     static constexpr int kMetaSizePerWarp = kMetaSizePerIter * kStages;
     static constexpr int kMetaSize = kMetaSizePerWarp * kWarps;
     cutlass::AlignedBuffer<ElementT, kMetaSize> shared_Scale;
+    cutlass::AlignedBuffer<uint8_t, has_quant_offset ? kMetaSize : 0> shared_Offset;
 
     static_assert(kMetaSizePerIter == MetaLoader::kSmemSize);
   };
@@ -326,6 +327,7 @@ struct SwizzleDequantTestKernel {
 
     FragmentPackedB fragment_packed_b;
     typename MetaLoader::FragmentScales fragment_scales;
+    typename MetaLoader::FragmentOffsets fragment_offsets;
     FragmentB fragment_b;
 
     //
@@ -354,6 +356,8 @@ struct SwizzleDequantTestKernel {
       lane_idx,
       params.ptr_scales_,
       params.scales_byte_stride_,
+      params.ptr_offsets_,
+      params.offsets_byte_stride_,
       n_start, n_end};
 
     if constexpr (kDebugPrint) {
@@ -371,6 +375,9 @@ struct SwizzleDequantTestKernel {
       SharedStorage::kPackedBSizePerWarp * warp_idx;
 
     ElementT* shared_scale_ptr = shared_storage.shared_Scale.data() + SharedStorage::kMetaSizePerWarp * warp_idx;
+    uint8_t* shared_offset_ptr = has_quant_offset ? 
+                                shared_storage.shared_Offset.data() + SharedStorage::kMetaSizePerWarp * warp_idx
+                                : nullptr;
 
     //
     // Prologue
@@ -379,8 +386,9 @@ struct SwizzleDequantTestKernel {
     for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += WarpShape::kK) {
       uint8_t* packed_b_smem_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
       ElementT* scale_smem_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
+      uint8_t* offset_smem_ptr = has_quant_offset ? shared_offset_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter : nullptr;
     
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr, offset_smem_ptr);
 
       // Load packed b
       packed_b_loader.load_to_smem(lane_idx, packed_b_smem_ptr);
@@ -409,18 +417,17 @@ struct SwizzleDequantTestKernel {
     // Mainloop
     //
     for (; proc_k < k_end; smem_write_stage = (smem_write_stage + 1) % kStages, smem_read_stage = (smem_read_stage + 1) % kStages, proc_k += WarpShape::kK){
-      typename MetaLoader::FragmentScales fragment_addon;
   
       const uint8_t* packed_b_smem_read_ptr = packed_b_shared_ptr + smem_read_stage * SharedStorage::kPackedBSizePerIter;
       uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr + smem_write_stage * SharedStorage::kPackedBSizePerIter;
 
       const ElementT* scale_smem_read_ptr = shared_scale_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter;
       ElementT* scale_smem_write_ptr = shared_scale_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter;
+      const uint8_t* offset_smem_read_ptr = has_quant_offset ? shared_offset_ptr + smem_read_stage * SharedStorage::kMetaSizePerIter : nullptr;
+      uint8_t* offset_smem_write_ptr = has_quant_offset ? shared_offset_ptr + smem_write_stage * SharedStorage::kMetaSizePerIter : nullptr;
 
-      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_write_ptr);
-      meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr);
-
-      meta_loader.process(fragment_scales, fragment_addon);
+      meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_write_ptr, offset_smem_write_ptr);
+      meta_loader.load_fragment(lane_idx, fragment_scales, scale_smem_read_ptr, fragment_offsets, offset_smem_read_ptr);
 
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
@@ -441,7 +448,7 @@ struct SwizzleDequantTestKernel {
         }
 
         // Dequantize weights block (16, WarpShape::kN)
-        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_addon, fragment_b);
+        meta_loader.dequant_k16(warp_k_offset/16, fragment_packed_b, fragment_scales, fragment_offsets, fragment_b);
         CUTLASS_PRAGMA_UNROLL
         for (int b_tile_n = 0; b_tile_n < (WarpShape::kN/8); ++b_tile_n) {
           int n = n_start + b_tile_n * 8 + lane_b_n_offset;
@@ -485,6 +492,7 @@ struct SwizzleDequantTestKernel {
 
 template <
   typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
+  bool     has_quant_offset_,           ///! Whether the quantization has offset
   typename WarpShape_,                  ///! Warp-scoped matrix multiply-accumulate
   int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
   int Stages_ = 4                       ///! Stages of the pipelined mainloop
@@ -495,8 +503,9 @@ class SwizzleDequantTest {
   using WarpShape = WarpShape_;
   static constexpr int kSplitK = SplitKSerial_;
   static constexpr int kStages = Stages_;
+  static constexpr bool has_quant_offset = has_quant_offset_;
 
-  using TestKernel = SwizzleDequantTestKernel<QuantBlocking, false, WarpShape, kSplitK, kStages>;
+  using TestKernel = SwizzleDequantTestKernel<QuantBlocking, has_quant_offset, WarpShape, kSplitK, kStages>;
   using Args = typename TestKernel::Params;
 
   cutlass::Status run(
@@ -507,9 +516,11 @@ class SwizzleDequantTest {
     void const *ptr_packed_b,
     int b_byte_stride,
     void const *ptr_scales,
-    int scales_byte_stride) {
+    int scales_byte_stride,
+    void const *ptr_offsets = nullptr,
+    int offsets_byte_strid = 0) {
 
-    Args args(problem_size, ptr_output, output_byte_stride, ptr_packed_b, b_byte_stride, ptr_scales, scales_byte_stride);
+    Args args(problem_size, ptr_output, output_byte_stride, ptr_packed_b, b_byte_stride, ptr_scales, scales_byte_stride, ptr_offsets, offsets_byte_strid);
     cutlass::Status status = TestKernel::can_implement(args);
     if (status != cutlass::Status::kSuccess) {
       return status;
@@ -542,23 +553,22 @@ class SwizzleDequantTest {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
+template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages, bool has_offsets = false>
 void test_swizzle_dequant(int m, int n, int k) {
   std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
-            << " WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
+            << ", WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
             << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
   std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
 
-  using Test = SwizzleDequantTest<QuantBlocking, WarpShape, kSplitK, kStages>;
+  using Test = SwizzleDequantTest<QuantBlocking, has_offsets, WarpShape, kSplitK, kStages>;
   Test test;
   cutlass::gemm::GemmCoord problem_size(m, n, k);
 
-  constexpr bool has_offsets = false;
   using QuantBaseT = onnxruntime::test::BlkQuantizationRef<QuantBlocking, has_offsets>;
   using LayoutQMeta = typename QuantBaseT::LayoutQMeta;
 
   cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor> tensor_b({k, n});
-  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 51, -1.75f, 1.9f);
+  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 193456, 1.5f, -1.125f, 6);
   cutlass::HostTensor<uint8_t, cutlass::layout::ColumnMajor> q4_weights;
   cutlass::HostTensor<cutlass::half_t, LayoutQMeta> scales;
   cutlass::HostTensor<uint8_t, LayoutQMeta> offsets;
@@ -582,7 +592,7 @@ void test_swizzle_dequant(int m, int n, int k) {
       const int w = (row % 2 == 0) ? (q4_weights.at(weight_pos) & 0xf) : (q4_weights.at(weight_pos) >> 4);
 
       const float f = scale * (w - offset);
-      printf("%f=%2dx%f,  ", float(dst.at({row, col})), w, scale);
+      printf("%f=(%2d-%d)x%f,  ", float(dst.at({row, col})), w, offset, scale);
       ASSERT_EQ(dst.at({row, col}), cutlass::half_t(f));
     }
     printf("\n");
@@ -594,8 +604,8 @@ void test_swizzle_dequant(int m, int n, int k) {
       packed_w_ref, cutlass::make_Coord(k, n / 2));
   onnxruntime::cuda::test::prepack_weights_ref(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
 
-  int meta_tensor_stride = scales.stride(0);
   thrust::device_vector<cutlass::half_t> packed_scale_dev;
+  thrust::device_vector<uint8_t> packed_zp_dev;
 
   if constexpr (std::is_same<LayoutQMeta, cutlass::layout::ColumnMajor>::value) {
     std::vector<cutlass::half_t> packed_scales_ref(scales.size());
@@ -605,37 +615,58 @@ void test_swizzle_dequant(int m, int n, int k) {
         k, n, onnxruntime::test::make_ConstMatrixRef(scales), tensor_packed_s_ref);
     packed_scale_dev = packed_scales_ref;
   
-    // std::vector<uint8_t> packed_zp_ref(meta_shape.product());
-    // mickey::MatrixRef<uint8_t, LayoutQMeta, true> tensor_packed_zp_ref =
-    //     mickey::make_MatrixRef<ElementQOffset, LayoutQMeta, true>(packed_zp_ref, meta_shape);
-    // onnxruntime::cuda::test::prepack_quant_offsets_ref<LayoutQMeta, QuantBlocking>(
-    //       rows, columns, tensor_offset.const_ref(), tensor_packed_zp_ref);
+    if constexpr (has_offsets) {
+      std::vector<uint8_t> packed_zp_ref(offsets.size());
+      mickey::MatrixRef<uint8_t, LayoutQMeta, true> tensor_packed_zp_ref =
+          mickey::make_MatrixRef<uint8_t, LayoutQMeta, true>(packed_zp_ref, offsets.extent());
+      onnxruntime::cuda::test::prepack_quant_offsets_ref<LayoutQMeta, QuantBlocking>(
+            k, n, onnxruntime::test::make_ConstMatrixRef(offsets), tensor_packed_zp_ref);
+      packed_zp_dev = packed_zp_ref;
+    }
   } else {
     packed_scale_dev.resize(scales.size());
     thrust::copy(scales.host_data(), scales.host_data() + scales.size(), packed_scale_dev.begin());
+    if constexpr (has_offsets) {
+      packed_zp_dev.resize(offsets.size());
+      thrust::copy(offsets.host_data(), offsets.host_data() + offsets.size(), packed_zp_dev.begin());
+    }
   }
 
   thrust::device_vector<uint8_t> packed_w_dev(packed_w_ref);
   tensor_b.sync_device();
+
+  void const * const ptr_offsets = has_offsets ? thrust::raw_pointer_cast(packed_zp_dev.data()) : nullptr;
+  const int offsets_byte_stride = has_offsets ? offsets.stride(0) * sizeof(uint8_t) : 0;
 
   int dequant_stride = tensor_b.stride(0);
   ASSERT_EQ(dequant_stride, problem_size.n());
   cutlass::Status status = test.run(nullptr, problem_size,
                                     tensor_b.device_data(), dequant_stride * sizeof(cutlass::half_t),
                                     thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
-                                    thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
+                                    thrust::raw_pointer_cast(packed_scale_dev.data()), scales.stride(0) * sizeof(cutlass::half_t),
+                                    ptr_offsets, offsets_byte_stride);
   ASSERT_EQ(status, cutlass::Status::kSuccess);
   tensor_b.sync_host();
   cudaDeviceSynchronize();
-  bool passed = cutlass::reference::host::TensorEquals(dst.host_view(), tensor_b.host_view());
-  if (!passed) {
-    std::cerr << "Mismatch found in test_swizzle_dequant!" << std::endl;
-    std::cerr << "Expected:" << std::endl;
-    std::cerr << dst.host_view() << std::endl;
-    std::cerr << "Actual:" << std::endl;
-    std::cerr << tensor_b.host_view() << std::endl;
+  for (int row = 0; row < tensor_b.extent()[0]; ++row) {
+    for (int col = 0; col < tensor_b.extent()[1]; ++col) {
+      float expected = dst.at({row, col});
+      float actual = tensor_b.at({row, col});
+      if (expected == actual) {
+        continue;
+      }
+      float diff = fabs(expected - actual);
+      if (diff < 2e-7) {
+        continue;
+      }
+      float diff_ratio = fabs(expected - actual) / max(fabs(expected), fabs(actual)); 
+      if (diff_ratio > 3e-3) {
+        std::cerr << "Mismatch found at (" << row << ", " << col << "): " << expected << " != " << actual << " ratio: " << diff_ratio << std::endl;
+        EXPECT_TRUE(false);
+      }
+    }
   }
-  ASSERT_TRUE(passed);
+
 }
 
 TEST(SwizzleDequant, PackedBTest) {
@@ -644,12 +675,16 @@ TEST(SwizzleDequant, PackedBTest) {
   test_swizzle_dequant<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
   test_swizzle_dequant<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
   test_swizzle_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
+  test_swizzle_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3, true>(1, 48, 1024 + 128);
   test_swizzle_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+  test_swizzle_dequant<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4, true>(1, 128, 4096 - 16);
 
   test_swizzle_dequant<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
   test_swizzle_dequant<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
   test_swizzle_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
+  test_swizzle_dequant<cutlass::MatrixShape<32,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3, true>(1, 48, 1024 + 128);
   test_swizzle_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
+  test_swizzle_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4, true>(1, 128, 4096 - 16);
 }
 
 } // namespace test

@@ -20,6 +20,11 @@
 
 #include "cute/layout.hpp"
 
+union Float16 {
+    uint16_t bits;
+    half value;
+};
+
 __global__ void test_kernel(int const* input,
                     int* output){
     __shared__ int smem[128];
@@ -29,6 +34,11 @@ __global__ void test_kernel(int const* input,
     cutlass::arch::cp_async_wait<0>();
     output[0] = smem[0];
 
+    Float16 f16;
+    f16.value = 1032.0f;
+    printf("1032: %x\n", f16.bits);
+    f16.value = -72.0f;
+    printf("-72: %x\n", f16.bits);
 }
 
 
