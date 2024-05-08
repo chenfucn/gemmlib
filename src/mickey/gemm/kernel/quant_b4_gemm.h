@@ -709,67 +709,20 @@ struct QuantB4Gemm {
     // But combining them into one loop seems to confuse the compiler, causing
     // the accumulators to be stored in local memory instead of registers.
     const int lane_m_idx = div_power2<4>(lane_idx);
-    switch (lane_m_idx % 4)
-    {
-    case 0:
+    CUTLASS_PRAGMA_UNROLL
+    for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+      const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
       CUTLASS_PRAGMA_UNROLL
-      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile * 8;
-          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
-          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
-        }
-      }
-      break;
+      for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+        const float2* acc_frag = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
 
-    case 1:
-      CUTLASS_PRAGMA_UNROLL
-      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-          const int n_tile_offset = (n_tile + 1) % (WarpShape::kN / 8);
-          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
-          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
-          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
-        }
+        const int n_position = warp_n_idx * WarpShape::kN       // start of the warp
+                             + n_tile * 8                       // start of the tile
+                             + (mod_power2<4>(lane_idx) << 1);  // lane within the tile
+        const int smem_offset_n = (n_position + 8 * (lane_m_idx % 4)) % ThreadblockShape::kN;
+        *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + smem_offset_n / 2) = acc_frag[0];
       }
-      break;    
-
-    case 2:
-      CUTLASS_PRAGMA_UNROLL
-      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-          const int n_tile_offset = (n_tile + 2) % (WarpShape::kN / 8);
-          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
-          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
-          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
-        }
-      }
-      break;
-
-    case 3:
-      CUTLASS_PRAGMA_UNROLL
-      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
-        CUTLASS_PRAGMA_UNROLL
-        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-          const int n_tile_offset = (n_tile + 3) % (WarpShape::kN / 8);
-          const int n = warp_n_idx * WarpShape::kN + (mod_power2<4>(lane_idx) << 1) + n_tile_offset * 8;
-          const float2* c_ptr = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile_offset * (WarpShape::kM / 8);
-          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + n/2) = c_ptr[0];
-        }
-      }
-      break;
-
-    default:
-      break;
     }
-
 
     if constexpr (kKWarps > 1) {
       __syncthreads();
@@ -790,7 +743,7 @@ struct QuantB4Gemm {
       CUTLASS_PRAGMA_UNROLL
       for (int n = 0; n < kAccLoadsN; ++n) {
         const int row_idx = m * kWarps + warp_idx;
-        const int col_idx = n * (4 * 32) + lane_idx * 4;
+        const int col_idx = ((n * (4 * 32) + lane_idx * 4) + 8 * (row_idx % 4)) % ThreadblockShape::kN;  // shift n position the same amount as how we stored it, avoid bank conflict
         const int offset = row_idx * ThreadblockShape::kN + col_idx;
         for (int k = 0; k < kKWarps; ++k) {
           cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.posfix.shared_Acc[k].data() + offset);
