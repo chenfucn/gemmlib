@@ -765,8 +765,40 @@ struct QuantB4Gemm {
     const int lock_offset = blockIdx.x * gridDim.y + blockIdx.y;
     int mm = gridDim.x * ThreadblockShape::kM;
     int nn = gridDim.y * ThreadblockShape::kN;
-    // if (threadIdx.x == 0)
-    //   printf("Workspace size %d, %d\n", mm, nn);
+
+    using half4 = cutlass::Array<__half2, 2>;
+    static_assert(sizeof(half4) == sizeof(b64));
+    auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
+    int output_stride = params.output_byte_stride_ / sizeof(ElementT);
+    const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
+    const int tb_m_end = min(params.problem_size_.m(), mul_power2<ThreadblockShape::kM>(blockIdx.x + 1));
+    const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
+    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));
+
+    if (params.grid_tiled_shape_.k() == 1) {
+      // No split k, directly store to global memory
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < kAccLoadsM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < kAccLoadsN; ++n) {
+          const int row_idx = tb_m_start + m * kWarps + warp_idx;
+          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+          if (row_idx < tb_m_end && col_idx < tb_n_end) {
+            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
+            half4 tmp;
+            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+          }
+        }
+      }
+      return;  // All done for non-split k
+    }
+
+    //
+    // We have split k dimension into multiple blocks, we need to do reduction via global memory
+    //
     auto* split_k_locks = reinterpret_cast<b64*>(params.workspace_ + mm * nn * sizeof(float));
 
     SeqLock seq_lock(split_k_locks + lock_offset, params.grid_tiled_shape_.k());
@@ -781,16 +813,6 @@ struct QuantB4Gemm {
       __syncthreads();
       k_seq = shared_storage.posfix.block_k_reduction_id[0];
     }
-
-
-    using half4 = cutlass::Array<__half2, 2>;
-    static_assert(sizeof(half4) == sizeof(b64));
-    auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
-    int output_stride = params.output_byte_stride_ / sizeof(ElementT);
-    const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
-    const int tb_m_end = min(params.problem_size_.m(), mul_power2<ThreadblockShape::kM>(blockIdx.x + 1));
-    const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
-    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));
 
     float* red_buf = reinterpret_cast<float*>(params.workspace_);
 
