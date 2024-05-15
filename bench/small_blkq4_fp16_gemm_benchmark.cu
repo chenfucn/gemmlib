@@ -190,7 +190,7 @@ using LayoutQMeta =
 using ThreadblockShape = cutlass::gemm::GemmShape<32, 256, 64>;
 // Number of pipelines you want to use
 constexpr int NumStages = 3;
-constexpr int NumSplitK = 4;
+constexpr int NumSplitK = 8;
 
 using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, NumSplitK, NumStages>;
 using Args = typename TestKernel::Params;
