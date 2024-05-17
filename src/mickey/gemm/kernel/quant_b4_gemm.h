@@ -24,6 +24,7 @@
 #include "gemm/warp/swizzle_tile_loader.h"
 #include "gemm/warp/quantb_meta_loader.h"
 #include "int_util.h"
+#include "gemm_bricks.h"
 
 namespace mickey {
 namespace gemm {
@@ -42,8 +43,17 @@ struct SeqLock {
   uint32_t count_{kSeqStart - 2};     // sequence number
   b64* address_;
 
+  // Debug purpose only
+  const int blk_m_idx_;
+  const int blk_n_idx_;
+  const int blk_k_idx_;
+
   CUTLASS_DEVICE
-  SeqLock(b64* address, uint32_t max_k) : address_(address), max_k_(max_k) {}
+  SeqLock(b64* address, uint32_t max_k,
+          int blk_m_idx, int blk_n_idx, int blk_k_idx)
+    : address_(address), max_k_(max_k),
+      blk_m_idx_(blk_m_idx), blk_n_idx_(blk_n_idx), blk_k_idx_(blk_k_idx)
+  {}
 
   CUTLASS_DEVICE
   bool locked() const {
@@ -58,16 +68,20 @@ struct SeqLock {
   }
 
   CUTLASS_DEVICE
-  uint32_t lock() {
+  b64 fetch() {
+    b64 fetched;
+    asm volatile ("ld.global.acquire.gpu.b64 %0, [%1];\n" : "=l"(fetched) : "l"(address_));
+    return fetched;
+  }
+
+  CUTLASS_DEVICE
+  uint32_t lock(b64 fetched) {
     assert(!locked());
 
     // We use an 64b uninitialized memory location to store the lock.
     // There are 2 * max_k_ valid values among 2^64 possible ones.
     // This implementation considers the chance of uninitialized memory
     // to be valid is negligible.
-    b64 fetched;
-    asm volatile ("ld.global.acquire.gpu.b64 %0, [%1];\n" : "=l"(fetched) : "l"(address_));
-
     if (!valid(fetched, max_k_)) {
       // Unintialized memory, attempt to initialize it
       auto old = atomicCAS(reinterpret_cast<b64*>(address_), fetched, kInit);
@@ -84,7 +98,7 @@ struct SeqLock {
 
     if (!valid(fetched, max_k_)) {
       printf("Block(%d, %d, %d) Invalid %p, fetched  %llx\n",
-          blockIdx.x, blockIdx.y, blockIdx.z, address_, fetched);
+          blk_m_idx_, blk_n_idx_, blk_k_idx_, address_, fetched);
       assert(false);
     }
 
@@ -306,10 +320,10 @@ struct QuantB4Gemm {
 
     CUTLASS_HOST_DEVICE
     size_t workspace_size() const {
-      int mm = grid_tiled_shape_.m() * ThreadblockShape::kM;
-      int nn = grid_tiled_shape_.n() * ThreadblockShape::kN;
+      int grid_m = grid_tiled_shape_.m() * ThreadblockShape::kM;
+      int grid_n = grid_tiled_shape_.n() * ThreadblockShape::kN;
       return grid_tiled_shape_.k() == 1 ? 0
-             : sizeof(b64) * grid_tiled_shape_.m() * grid_tiled_shape_.n() + mm * nn * sizeof(float);
+             : sizeof(b64) * grid_tiled_shape_.m() * grid_tiled_shape_.n() + grid_m * grid_n * sizeof(float);
     }
 
     CUTLASS_HOST_DEVICE
@@ -398,9 +412,11 @@ struct QuantB4Gemm {
 
     if constexpr (kSplitK > 1){
       // TODO! Use thread block shape
-      if (params.gemm_k_size_ < ThreadblockShape::kK * kStages + 2) {
+      if (params.gemm_k_size_ < ThreadblockShape::kK * kStages) {
         // spliting too small, may not get enough iterations to rampup pipeline
-        std::cerr << "QuantB4Gemm validation fail: kSplitK is too small, k: " << params.gemm_k_size_ << " is smaller than " << (ThreadblockShape::kK * kStages + 2) << std::endl;
+        std::cerr << "QuantB4Gemm validation fail: kSplitK is too small, k: "
+                  << params.gemm_k_size_ << " is smaller than "
+                  << (ThreadblockShape::kK * kStages) << std::endl;
         return cutlass::Status::kErrorNotSupported;
       }
     }
@@ -411,28 +427,14 @@ struct QuantB4Gemm {
   /// Executes one GEMM
   CUTLASS_DEVICE
   void operator()(Params const &params, SharedStorage &shared_storage) {
-    // Early exit if CTA is out of range
-    if (params.grid_tiled_shape_.m() <= blockIdx.x ||
-      params.grid_tiled_shape_.n() <= blockIdx.y ||
-      params.grid_tiled_shape_.k() <= blockIdx.z) {
-      // should not happen
-      if (threadIdx.x == 0) {
-        printf("CTA out of range %d, %d, %d\n", blockIdx.x, blockIdx.y, blockIdx.z);
-      }
-      return;
-    }
-
-    if (params.grid_tiled_shape_.k() > 1){
-      assert(params.workspace_ != nullptr);
-    }
-
-    //
-    // Initialization phase: locating our position
-    //
     const int warp_idx = div_power2<32>(threadIdx.x);
     const int lane_idx = mod_power2<32>(threadIdx.x);
     const int warp_n_idx = div_power2<kKWarps>(warp_idx);
     const int warp_k_idx = mod_power2<kKWarps>(warp_idx);
+    const int warp_k_offset = mul_power2<WarpShape::kK>(warp_k_idx);
+
+    const int grid_m = params.grid_tiled_shape_.m() * ThreadblockShape::kM;
+    const int grid_n = params.grid_tiled_shape_.n() * ThreadblockShape::kN;
 
 #ifndef NDEBUG
     bool assert_pass = true;
@@ -446,443 +448,496 @@ struct QuantB4Gemm {
     assert(assert_pass);
 #endif
 
-    const int m_start = blockIdx.x * ThreadblockShape::kM;
-    const int m_end = min(params.problem_size_.m(), (blockIdx.x + 1) * ThreadblockShape::kM);
-    const int n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y) + warp_n_idx * WarpShape::kN;
-    const int n_end = min(params.problem_size_.n(), n_start + WarpShape::kN);  
-    const int k_start = blockIdx.z * params.gemm_k_size_;
-    const int warp_k_offset = warp_k_idx * WarpShape::kK;
-    const int k_end = min(params.problem_size_.k(), (blockIdx.z + 1) * params.gemm_k_size_);
-
-    PackedBLoader packed_b_loader{
-      params.ptr_packed_b_,
-      params.b_byte_stride_,
-      n_start,
-      n_end,
-      k_start + warp_k_offset,
-      k_end,
-      lane_idx};
-
-    MetaLoader meta_loader{
-      lane_idx,
-      params.ptr_scales_,
-      params.scales_byte_stride_,
-      n_start, n_end};
-
-    ATileLoader a_tile_loader{
-      params.ptr_a_,
-      params.a_byte_stride_,
-      m_start, m_end,
-      mul_power2<kElementSize>(k_start), mul_power2<kElementSize>(k_end), // convert to byte based index
-      threadIdx.x};
-
     //
-    // Prologue: start loading from global memory to shared memory
+    // When the problem size is small, the caller may decide to launch the kernel
+    // with 'slicing', where the problem space is split into 3d bricks and try to
+    // evenly distribute these bricks into device SMs.
     //
-
-    int load_k = k_start; // current k index for loading from global memory to shared memory
-    int smem_write_stage = 0;
-    uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.main_loop.shared_B[warp_idx].data(), lane_idx);
-    ElementT* a_shared_ptr = shared_storage.main_loop.shared_A.data();
-    ElementT* scales_shared_ptr = shared_storage.main_loop.shared_Scale[warp_idx].data();
-
-    if constexpr (kDebugPrintSteps) {
-      if (lane_idx == 0) {
-        printf("Warp: %d, m_start %d, m_end %d, n_start %d, n_end %d, k_start %d, k_end %d\n    PackedB: %p, A: %p, Scales: %p\n",
-          warp_idx, m_start, m_end, n_start, n_end, k_start, k_end, packed_b_shared_ptr, a_shared_ptr, scales_shared_ptr);
-      }
+    using Bricks = mickey::BrickMap<ThreadblockShape>;
+    const bool map_bricks = (kSplitK > 1 && gridDim.z == 1 && gridDim.y == 1 && gridDim.x > 3);
+    Bricks brick_map;
+    if (map_bricks) {
+      brick_map.init(params.problem_size_.m(), params.problem_size_.n(), params.problem_size_.k(), gridDim.x);
+    } else {
+      brick_map.bricks_per_tb = 1;
     }
 
-    uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr;
-    ElementT* a_smem_write_ptr = a_shared_ptr;
-    ElementT* scales_smem_write_ptr = scales_shared_ptr;
+    for (int brick_idx = 0; brick_idx < brick_map.bricks_per_tb;) {
+      BrickPos brick_pos;
+      int k_start;
+      int k_end;
+      int total_k_split;
 
-    CUTLASS_PRAGMA_UNROLL
-    for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += ThreadblockShape::kK) {
-      const int warp_load_k = load_k + warp_k_offset;
-      meta_loader.load_to_smem(lane_idx, warp_load_k, min(k_end - warp_load_k, WarpShape::kK), scales_smem_write_ptr);
-      scales_smem_write_ptr += MmaSharedStorage::kMetaSizePerIter;
+      if (map_bricks) {
+        brick_pos = brick_map.getBrickPosition({int(blockIdx.x), brick_idx});
+        if (brick_pos.m >= brick_map.m_bricks) {
+          return;
+        }
+        k_start = mul_power2<Bricks::kK>(brick_pos.k);
+        k_end = min(params.problem_size_.k(), (brick_pos.k + (brick_map.bricks_per_tb - brick_idx)) * Bricks::kK);
 
-      // Load packed b
-      packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
-      packed_b_smem_write_ptr += MmaSharedStorage::kPackedBSizePerIter;
-      ++packed_b_loader;
+        int num_bricks = div_up(k_end - k_start, Bricks::kK);
+        brick_idx += num_bricks;
+#ifndef NDEBUG
+        assert(brick_idx <= brick_map.bricks_per_tb);
+#endif
 
-      // Load A
-      a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
-      a_smem_write_ptr += MmaSharedStorage::kASizePerIter;
-      ++a_tile_loader;
+        // compute global k splits
+        auto column_start = brick_map.getGridPos({brick_pos.m, brick_pos.n, 0});
+        auto column_end = brick_map.getGridPos({brick_pos.m, brick_pos.n, brick_map.k_bricks - 1});
+        total_k_split = column_end.tb_idx - column_start.tb_idx + 1;
+      } else {
+        brick_pos.m = blockIdx.x;
+        brick_pos.n = blockIdx.y;
+        brick_pos.k = blockIdx.z;
 
-      // Defines the boundary of a stage of cp.async.
-      cutlass::arch::cp_async_fence();
-    }    
+        k_start = blockIdx.z * params.gemm_k_size_;
+        k_end = min(params.problem_size_.k(), (blockIdx.z + 1) * params.gemm_k_size_);
+        total_k_split = gridDim.z;
+        brick_idx = brick_map.bricks_per_tb;
+      }
 
-    // Prepare for the main loop, declare fragments and accumulators,
-    // hopefully allocated in registers
-    typename PackedBLoader::Fragment fragment_packed_b[2];
-    typename MetaLoader::FragmentScales fragment_scales[2];
-    FragmentB fragment_b;
-    FragmentA fragment_a[2];
-    typename MmaOp::FragmentC accumulators;
-    accumulators.clear();
-  
-    MmaOp mma_op;
+      // if (threadIdx.x == kThreads - 1) {
+      //   printf("Block(%d, %d, %d) Brick %d, Start %d, End %d, Total %d\n",
+      //       brick_pos.m, brick_pos.n, brick_pos.k, brick_idx, k_start, k_end, total_k_split);
+      // }
 
-    // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
-    cutlass::arch::cp_async_wait<kStages - 2>();
-    __syncthreads();
-    if constexpr(kDebugPrintA) {
-      if (threadIdx.x == 0) {
-        printf("\n****** Shared memory of A %p ******\n", a_shared_ptr);
-        for (int i = 0; i < MmaSharedStorage::kASize; i += 64) {
-          for (int j = 0; j < 64; ++j) {
-            printf("%f, ", float(a_shared_ptr[i + j]));
-          }
-          printf("\n");
+      const int tb_n_start = mul_power2<ThreadblockShape::kN>(brick_pos.n);
+      const int m_start = mul_power2<ThreadblockShape::kM>(brick_pos.m);
+      const int n_start = tb_n_start + mul_power2<WarpShape::kN>(warp_n_idx);
+      const int tb_n_end = min(params.problem_size_.n(), tb_n_start + ThreadblockShape::kN);
+      const int m_end = min(params.problem_size_.m(), m_start + ThreadblockShape::kM);
+      const int n_end = min(params.problem_size_.n(), n_start + WarpShape::kN);  
+
+      PackedBLoader packed_b_loader{
+        params.ptr_packed_b_,
+        params.b_byte_stride_,
+        n_start,
+        n_end,
+        k_start + warp_k_offset,
+        k_end,
+        lane_idx};
+
+      MetaLoader meta_loader{
+        lane_idx,
+        params.ptr_scales_,
+        params.scales_byte_stride_,
+        n_start, n_end};
+
+      ATileLoader a_tile_loader{
+        params.ptr_a_,
+        params.a_byte_stride_,
+        m_start, m_end,
+        mul_power2<kElementSize>(k_start), mul_power2<kElementSize>(k_end), // convert to byte based index
+        threadIdx.x};
+
+      //
+      // Prologue: start loading from global memory to shared memory
+      //
+
+      int load_k = k_start; // current k index for loading from global memory to shared memory
+      int smem_write_stage = 0;
+      uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.main_loop.shared_B[warp_idx].data(), lane_idx);
+      ElementT* a_shared_ptr = shared_storage.main_loop.shared_A.data();
+      ElementT* scales_shared_ptr = shared_storage.main_loop.shared_Scale[warp_idx].data();
+
+      if constexpr (kDebugPrintSteps) {
+        if (lane_idx == 0) {
+          printf("Warp: %d, m_start %d, m_end %d, n_start %d, n_end %d, k_start %d, k_end %d\n    PackedB: %p, A: %p, Scales: %p\n",
+            warp_idx, m_start, m_end, n_start, n_end, k_start, k_end, packed_b_shared_ptr, a_shared_ptr, scales_shared_ptr);
         }
       }
-    }
 
-    //
-    // Prefix of the Mainloop, pre-loading the double buffer in registers
-    //
-    uint8_t const* packed_b_smem_read_ptr = packed_b_shared_ptr;
-    ElementT const* a_smem_read_ptr = a_shared_ptr;
-    ElementT const* scales_smem_read_ptr = scales_shared_ptr;
+      uint8_t* packed_b_smem_write_ptr = packed_b_shared_ptr;
+      ElementT* a_smem_write_ptr = a_shared_ptr;
+      ElementT* scales_smem_write_ptr = scales_shared_ptr;
 
-    if constexpr (kDebugPrintSteps) {
-      if (lane_idx == 0) {
-        printf("Prefix: PackedB[%d] <- %p <- %p,  A[%d] <- %p <- %p,  fragment_scales[%d] <- load_k %d <- %p <- %p\n",
-          0, packed_b_smem_read_ptr, packed_b_smem_write_ptr, 0, a_smem_read_ptr, a_smem_write_ptr, 0, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
-      }
-    }
-
-    meta_loader.load_fragment(lane_idx, fragment_scales[0], scales_smem_read_ptr);
-    meta_loader.load_to_smem(lane_idx, load_k + warp_k_offset, min(k_end - load_k - warp_k_offset, WarpShape::kK), scales_smem_write_ptr);
-    packed_b_loader.load_to_register(lane_idx, 0, packed_b_smem_read_ptr, fragment_packed_b[0]);
-
-    a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr, warp_k_offset * kElementSize, fragment_a[0].data());
-    a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
-
-    //
-    // Main loop
-    // proc_k = load_k - (kStages - 1) * ThreadblockShape::kK
-    //
-    while (load_k < k_end + (kStages - 1) * ThreadblockShape::kK){
-
-      // One stage has kMmaIterations, we unroll the main loop by 2,
-      // as the meta data is loaded only once every stage, need 2 stages
-      // to complete a double buffer cycle. This is necessary to make
-      // all indices compile time constants.
       CUTLASS_PRAGMA_UNROLL
-      for (int iter2 = 0; iter2 < kWarpMmaIterations * 2; ++iter2) {
-        const int iter = iter2 % kWarpMmaIterations;
-        const int next_iter2 = (iter2 + 1) % (kWarpMmaIterations * 2);
-        const int next_iter = next_iter2 % kWarpMmaIterations;
+      for (; smem_write_stage < kStages - 1; ++smem_write_stage, load_k += ThreadblockShape::kK) {
+        const int warp_load_k = load_k + warp_k_offset;
+        meta_loader.load_to_smem(lane_idx, warp_load_k, min(k_end - warp_load_k, WarpShape::kK), scales_smem_write_ptr);
+        scales_smem_write_ptr += MmaSharedStorage::kMetaSizePerIter;
 
-        // To speedup de-quantization, instead of using f = s * (q - z),
-        // we use f = s * q + (s * -z) to take advantage of the fma
-        // instruction. This is the storage of (s * -z)
-        typename MetaLoader::FragmentScales fragment_addon;
+        // Load packed b
+        packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
+        packed_b_smem_write_ptr += MmaSharedStorage::kPackedBSizePerIter;
+        ++packed_b_loader;
 
-        if (iter == 0) {
-          packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
+        // Load A
+        a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
+        a_smem_write_ptr += MmaSharedStorage::kASizePerIter;
+        ++a_tile_loader;
+
+        // Defines the boundary of a stage of cp.async.
+        cutlass::arch::cp_async_fence();
+      }    
+
+      // Prepare for the main loop, declare fragments and accumulators,
+      // hopefully allocated in registers
+      typename PackedBLoader::Fragment fragment_packed_b[2];
+      typename MetaLoader::FragmentScales fragment_scales[2];
+      FragmentB fragment_b;
+      FragmentA fragment_a[2];
+      typename MmaOp::FragmentC accumulators;
+      accumulators.clear();
+    
+      MmaOp mma_op;
+
+      // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
+      cutlass::arch::cp_async_wait<kStages - 2>();
+      __syncthreads();
+      if constexpr(kDebugPrintA) {
+        if (threadIdx.x == 0) {
+          printf("\n****** Shared memory of A %p ******\n", a_shared_ptr);
+          for (int i = 0; i < MmaSharedStorage::kASize; i += 64) {
+            for (int j = 0; j < 64; ++j) {
+              printf("%f, ", float(a_shared_ptr[i + j]));
+            }
+            printf("\n");
+          }
         }
+      }
 
-        if (next_iter == 0) {
-          cutlass::arch::cp_async_fence();  // Advance to the next stage
+      //
+      // Prefix of the Mainloop, pre-loading the double buffer in registers
+      //
+      uint8_t const* packed_b_smem_read_ptr = packed_b_shared_ptr;
+      ElementT const* a_smem_read_ptr = a_shared_ptr;
+      ElementT const* scales_smem_read_ptr = scales_shared_ptr;
 
-          const int read_stage_diff = (smem_write_stage == (kStages - 2)) ? (1 - kStages) : 1;
-          smem_write_stage = (smem_write_stage + 1) % kStages;
-          scales_smem_write_ptr = const_cast<ElementT*>(scales_smem_read_ptr);
-          packed_b_smem_write_ptr = const_cast<uint8_t*>(packed_b_smem_read_ptr);
-          a_smem_write_ptr = const_cast<ElementT*>(a_smem_read_ptr);
-          scales_smem_read_ptr += read_stage_diff * MmaSharedStorage::kMetaSizePerIter;
-          packed_b_smem_read_ptr += read_stage_diff * MmaSharedStorage::kPackedBSizePerIter;
-          a_smem_read_ptr += read_stage_diff * MmaSharedStorage::kASizePerIter;
-          ++packed_b_loader;
-          ++a_tile_loader;
+      if constexpr (kDebugPrintSteps) {
+        if (lane_idx == 0) {
+          printf("Prefix: PackedB[%d] <- %p <- %p,  A[%d] <- %p <- %p,  fragment_scales[%d] <- load_k %d <- %p <- %p\n",
+            0, packed_b_smem_read_ptr, packed_b_smem_write_ptr, 0, a_smem_read_ptr, a_smem_write_ptr, 0, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
+        }
+      }
 
-          cutlass::arch::cp_async_wait<kStages - 2>();
-          __syncthreads();
+      meta_loader.load_fragment(lane_idx, fragment_scales[0], scales_smem_read_ptr);
+      meta_loader.load_to_smem(lane_idx, load_k + warp_k_offset, min(k_end - load_k - warp_k_offset, WarpShape::kK), scales_smem_write_ptr);
+      packed_b_loader.load_to_register(lane_idx, 0, packed_b_smem_read_ptr, fragment_packed_b[0]);
 
-          load_k += ThreadblockShape::kK;
+      a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr, warp_k_offset * kElementSize, fragment_a[0].data());
+      a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
+
+      //
+      // Main loop
+      // proc_k = load_k - (kStages - 1) * ThreadblockShape::kK
+      //
+      while (load_k < k_end + (kStages - 1) * ThreadblockShape::kK){
+
+        // One stage has kMmaIterations, we unroll the main loop by 2,
+        // as the meta data is loaded only once every stage, need 2 stages
+        // to complete a double buffer cycle. This is necessary to make
+        // all indices compile time constants.
+        CUTLASS_PRAGMA_UNROLL
+        for (int iter2 = 0; iter2 < kWarpMmaIterations * 2; ++iter2) {
+          const int iter = iter2 % kWarpMmaIterations;
+          const int next_iter2 = (iter2 + 1) % (kWarpMmaIterations * 2);
+          const int next_iter = next_iter2 % kWarpMmaIterations;
+
+          // To speedup de-quantization, instead of using f = s * (q - z),
+          // we use f = s * q + (s * -z) to take advantage of the fma
+          // instruction. This is the storage of (s * -z)
+          typename MetaLoader::FragmentScales fragment_addon;
+
+          if (iter == 0) {
+            packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
+          }
+
+          if (next_iter == 0) {
+            cutlass::arch::cp_async_fence();  // Advance to the next stage
+
+            const int read_stage_diff = (smem_write_stage == (kStages - 2)) ? (1 - kStages) : 1;
+            smem_write_stage = (smem_write_stage + 1) % kStages;
+            scales_smem_write_ptr = const_cast<ElementT*>(scales_smem_read_ptr);
+            packed_b_smem_write_ptr = const_cast<uint8_t*>(packed_b_smem_read_ptr);
+            a_smem_write_ptr = const_cast<ElementT*>(a_smem_read_ptr);
+            scales_smem_read_ptr += read_stage_diff * MmaSharedStorage::kMetaSizePerIter;
+            packed_b_smem_read_ptr += read_stage_diff * MmaSharedStorage::kPackedBSizePerIter;
+            a_smem_read_ptr += read_stage_diff * MmaSharedStorage::kASizePerIter;
+            ++packed_b_loader;
+            ++a_tile_loader;
+
+            cutlass::arch::cp_async_wait<kStages - 2>();
+            __syncthreads();
+
+            load_k += ThreadblockShape::kK;
+            if constexpr (kDebugPrintSteps) {
+              if (lane_idx == 0) {
+                printf("fragment_scales[%d] <- load_k %d <- %p <- %p\n", (next_iter2 / kWarpMmaIterations) % 2, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
+              }
+            }
+            meta_loader.load_to_smem(lane_idx, load_k + warp_k_offset, min(k_end - load_k - warp_k_offset, WarpShape::kK), scales_smem_write_ptr);
+            meta_loader.load_fragment(lane_idx, fragment_scales[(next_iter2 / kWarpMmaIterations) % 2], scales_smem_read_ptr);
+            a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
+
+            if constexpr(kDebugPrintB) {
+              if (lane_idx == 0) {
+                printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
+                  warp_idx, load_k - (kStages - 1) * ThreadblockShape::kK, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
+              }
+              cutlass::debug::dump_shmem(packed_b_shared_ptr, MmaSharedStorage::kPackedBSize);
+            }
+          }
+
+          if (iter == 0) {
+            meta_loader.process(fragment_scales[(iter2 / kWarpMmaIterations) % 2], fragment_addon);
+          }
+
           if constexpr (kDebugPrintSteps) {
             if (lane_idx == 0) {
-              printf("fragment_scales[%d] <- load_k %d <- %p <- %p\n", (next_iter2 / kWarpMmaIterations) % 2, load_k, scales_smem_read_ptr, scales_smem_write_ptr);
+              printf("PackedB[%d] <- %p <- %p\n", (iter2 + 1) % 2, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
             }
           }
-          meta_loader.load_to_smem(lane_idx, load_k + warp_k_offset, min(k_end - load_k - warp_k_offset, WarpShape::kK), scales_smem_write_ptr);
-          meta_loader.load_fragment(lane_idx, fragment_scales[(next_iter2 / kWarpMmaIterations) % 2], scales_smem_read_ptr);
-          a_tile_loader.load_to_smem(threadIdx.x, a_smem_write_ptr);
+          packed_b_loader.load_to_register(lane_idx, next_iter, packed_b_smem_read_ptr, fragment_packed_b[(iter2 + 1) % 2]);
 
-          if constexpr(kDebugPrintB) {
+          if constexpr (kDebugPrintSteps) {
             if (lane_idx == 0) {
-              printf("Mainloop, warp: %d, proc_k %d, load_k %d\nWritePtr: %p, ReadPtr: %p\n",
-                warp_idx, load_k - (kStages - 1) * ThreadblockShape::kK, load_k, packed_b_smem_write_ptr, packed_b_smem_read_ptr);
-            }
-            cutlass::debug::dump_shmem(packed_b_shared_ptr, MmaSharedStorage::kPackedBSize);
-          }
-        }
-
-        if (iter == 0) {
-          meta_loader.process(fragment_scales[(iter2 / kWarpMmaIterations) % 2], fragment_addon);
-        }
-
-        if constexpr (kDebugPrintSteps) {
-          if (lane_idx == 0) {
-            printf("PackedB[%d] <- %p <- %p\n", (iter2 + 1) % 2, packed_b_smem_read_ptr, packed_b_smem_write_ptr);
-          }
-        }
-        packed_b_loader.load_to_register(lane_idx, next_iter, packed_b_smem_read_ptr, fragment_packed_b[(iter2 + 1) % 2]);
-
-        if constexpr (kDebugPrintSteps) {
-          if (lane_idx == 0) {
-            printf("A[%d] <- %p <- %p\n",  (iter2 + 1) % 2, a_smem_read_ptr, a_smem_write_ptr);
-          }
-        }
-        a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr,
-                                        (warp_k_offset + next_iter * InstructionShape::kK) * kElementSize,
-                                        fragment_a[(iter2 + 1) % 2].data());
-
-        if constexpr (kDebugPrintA) {
-          const int lane_id = threadIdx.x % 32;
-          if (lane_id == 0) {
-            printf("====  A tiles =======\n");
-          }
-          const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          const ElementT* a_ptr = fragment_a[iter2 % 2].data();
-          for (int m2_tile = 0; m2_tile < (ThreadblockShape::kM / InstructionShape::kM); ++m2_tile, a_ptr += 8) {
-            printf(format, float(a_ptr[0]), float(a_ptr[1]));
-            printf(format, float(a_ptr[2]), float(a_ptr[3]));
-            printf(format, float(a_ptr[4]), float(a_ptr[5]));
-            printf(format, float(a_ptr[6]), float(a_ptr[7]));
-          }
-        }
-
-        // Dequantize weights block (16, ThreadblockShape::kN)
-        if constexpr (kDebugPrintSteps) {
-          if (lane_idx == 0) {
-            printf("Mma(PackedB[%d], fragment_scales[%d], A[%d])\n", (iter2 / kWarpMmaIterations) % 2, (iter2 / kWarpMmaIterations) % 2, iter2 % 2);
-          }
-        }
-        meta_loader.dequant_k16(iter, fragment_packed_b[iter2 % 2], fragment_scales[(iter2 / kWarpMmaIterations) % 2], fragment_addon, fragment_b);
-
-        // GEMM operation, covering a shape of (ThreadblockShape::kM, ThreadblockShape::kN, InstructionShape::kK)
-        mma_op(accumulators, fragment_a[iter2 % 2], fragment_b, accumulators);
-      }  // next k block (stride = 16)
-    }  // Main loop: next stage
-
-    if constexpr (kDebugPrintC) {
-      static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
-      for (int warp = 0; warp < kWarps; ++warp) {
-        if (warp_idx == warp) {
-          const float* c_ptr = accumulators.data();
-          const int lane_id = threadIdx.x % 32;
-          if (lane_id == 0) {
-            printf("======= C tiles in warp %d =======\n", warp_idx);
-          }
-          const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
-          for (int n_tile = 0; n_tile < (ThreadblockShape::kN / InstructionShape::kN); ++n_tile) {
-            for (int m_tile = 0; m_tile < (ThreadblockShape::kM / InstructionShape::kM); ++m_tile, c_ptr += 4) {
-              // since InstructionShape::kM is 16, we can print 2 tiles
-              printf(format, float(c_ptr[0]), float(c_ptr[1]));
-              printf(format, float(c_ptr[2]), float(c_ptr[3]));
+              printf("A[%d] <- %p <- %p\n",  (iter2 + 1) % 2, a_smem_read_ptr, a_smem_write_ptr);
             }
           }
+          a_tile_loader.load_fragment_k32(lane_idx, a_smem_read_ptr,
+                                          (warp_k_offset + next_iter * InstructionShape::kK) * kElementSize,
+                                          fragment_a[(iter2 + 1) % 2].data());
+
+          if constexpr (kDebugPrintA) {
+            const int lane_id = threadIdx.x % 32;
+            if (lane_id == 0) {
+              printf("====  A tiles =======\n");
+            }
+            const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
+            const ElementT* a_ptr = fragment_a[iter2 % 2].data();
+            for (int m2_tile = 0; m2_tile < (ThreadblockShape::kM / InstructionShape::kM); ++m2_tile, a_ptr += 8) {
+              printf(format, float(a_ptr[0]), float(a_ptr[1]));
+              printf(format, float(a_ptr[2]), float(a_ptr[3]));
+              printf(format, float(a_ptr[4]), float(a_ptr[5]));
+              printf(format, float(a_ptr[6]), float(a_ptr[7]));
+            }
+          }
+
+          // Dequantize weights block (16, ThreadblockShape::kN)
+          if constexpr (kDebugPrintSteps) {
+            if (lane_idx == 0) {
+              printf("Mma(PackedB[%d], fragment_scales[%d], A[%d])\n", (iter2 / kWarpMmaIterations) % 2, (iter2 / kWarpMmaIterations) % 2, iter2 % 2);
+            }
+          }
+          meta_loader.dequant_k16(iter, fragment_packed_b[iter2 % 2], fragment_scales[(iter2 / kWarpMmaIterations) % 2], fragment_addon, fragment_b);
+
+          // GEMM operation, covering a shape of (ThreadblockShape::kM, ThreadblockShape::kN, InstructionShape::kK)
+          mma_op(accumulators, fragment_a[iter2 % 2], fragment_b, accumulators);
+        }  // next k block (stride = 16)
+      }  // Main loop: next stage
+
+      if constexpr (kDebugPrintC) {
+        static_assert(MmaOp::FragmentC::kElements == (WarpShape::kN / InstructionShape::kN) * (WarpShape::kM / InstructionShape::kM) * 4);
+        for (int warp = 0; warp < kWarps; ++warp) {
+          if (warp_idx == warp) {
+            const float* c_ptr = accumulators.data();
+            const int lane_id = threadIdx.x % 32;
+            if (lane_id == 0) {
+              printf("======= C tiles in warp %d =======\n", warp_idx);
+            }
+            const char* const format = (lane_id == 31) ? "%f, %f\n\n" : ((lane_id % 4) == 3) ? "%f, %f\n" : "%f, %f, ";
+            for (int n_tile = 0; n_tile < (ThreadblockShape::kN / InstructionShape::kN); ++n_tile) {
+              for (int m_tile = 0; m_tile < (ThreadblockShape::kM / InstructionShape::kM); ++m_tile, c_ptr += 4) {
+                // since InstructionShape::kM is 16, we can print 2 tiles
+                printf(format, float(c_ptr[0]), float(c_ptr[1]));
+                printf(format, float(c_ptr[2]), float(c_ptr[3]));
+              }
+            }
+          }
+          __syncthreads();
         }
+      }
+
+      cutlass::arch::cp_async_wait<0>();
+      __syncthreads();
+      // ========================== Finish the main loop ==========================
+      // !!!!! SHOULD NOT ACCESS main_loop SHARED MEMORY AFTER THIS POINT !!!!!
+
+      //
+      // global lock for global split k reduction.
+      b64* lock_address = nullptr;
+      if constexpr (kSplitK > 1) {
+        auto* split_k_locks = reinterpret_cast<b64*>(params.workspace_ + grid_m * grid_n * sizeof(float));
+        const int lock_offset = brick_pos.m * params.grid_tiled_shape_.n() + brick_pos.n;
+        lock_address = split_k_locks + lock_offset;
+      }
+      SeqLock seq_lock(lock_address, total_k_split, brick_pos.m, brick_pos.n, brick_pos.k);
+
+      // Early prefetch of lock value as it takes time to read from global memory
+      b64 lock_value;
+      if (threadIdx.x == (kThreads - 1) && total_k_split > 1) {
+        lock_value = seq_lock.fetch();
+      }
+    
+      // Store partial result to shared memory
+      float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.posfix.shared_Acc[warp_k_idx].data());
+
+      // With a single store, each warp writes a tile of (8x8) floats to shared memory,
+      // causing bank conflict, as all element (m,0) m = 0~7 are stored in the same bank.
+      // To avoid this, for different row, we shift the write position by 0, 1, 2, 3.
+      const int lane_m_idx = div_power2<4>(lane_idx);
+      CUTLASS_PRAGMA_UNROLL
+      for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
+        const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+        CUTLASS_PRAGMA_UNROLL
+        for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
+          const float2* acc_frag = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
+
+          const int n_position = mul_power2<WarpShape::kN>(warp_n_idx) // start of the warp
+                               + n_tile * 8                       // start of the tile
+                               + (mod_power2<4>(lane_idx) << 1);  // lane within the tile
+          const int smem_offset_n = (n_position + 8 * (lane_m_idx % 4)) % ThreadblockShape::kN;
+          *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + smem_offset_n / 2) = acc_frag[0];
+        }
+      }
+
+      if constexpr (kKWarps > 1) {
         __syncthreads();
       }
-    }
 
-    cutlass::arch::cp_async_wait<0>();
-    __syncthreads();
-    // ========================== Finish the main loop ==========================
-    // !!!!! SHOULD NOT ACCESS main_loop SHARED MEMORY AFTER THIS POINT !!!!!
-  
-    // Store partial result to shared memory
-    float2* const pacc_smem_ptr = reinterpret_cast<float2*>(shared_storage.posfix.shared_Acc[warp_k_idx].data());
+      // ========================== Warp reduction ==========================
+      // Loading TB::kM x TB::kN row major from shared memory.
+      // Each smem load 16 bytes, i.e. 4 floats. Each warp loads 4 x 32 = 128
+      // floats.
+      static_assert(ThreadblockShape::kN >= (4 * 32)); // make math simpler
+      constexpr int kAccLoadsN = ThreadblockShape::kN / (4 * 32);
+      static_assert(ThreadblockShape::kM % kWarps == 0);
+      constexpr int kAccLoadsM = ThreadblockShape::kM / kWarps;
 
-    // With a single store, each warp writes a tile of (8x8) floats to shared memory,
-    // causing bank conflict, as all element (m,0) m = 0~7 are stored in the same bank.
-    // To avoid this, for different row, we shift the write position by 0, 1, 2, 3.
-    // The following 4 loops are almost identical except the n_tile_offset shift.
-    // But combining them into one loop seems to confuse the compiler, causing
-    // the accumulators to be stored in local memory instead of registers.
-    const int lane_m_idx = div_power2<4>(lane_idx);
-    CUTLASS_PRAGMA_UNROLL
-    for (int m_tile = 0; m_tile < (WarpShape::kM / 8); ++m_tile) {
-      const int m = lane_m_idx + m_tile * 8;  // assuming no m split among warps
+      cutlass::Array<float2, 2> other_acc[kAccLoadsM][kAccLoadsN];
       CUTLASS_PRAGMA_UNROLL
-      for (int n_tile = 0; n_tile < (WarpShape::kN / 8); ++n_tile) {
-        const float2* acc_frag = reinterpret_cast<float2 const*>(accumulators.data()) + m_tile + n_tile * (WarpShape::kM / 8);
-
-        const int n_position = warp_n_idx * WarpShape::kN       // start of the warp
-                             + n_tile * 8                       // start of the tile
-                             + (mod_power2<4>(lane_idx) << 1);  // lane within the tile
-        const int smem_offset_n = (n_position + 8 * (lane_m_idx % 4)) % ThreadblockShape::kN;
-        *(pacc_smem_ptr + m * (ThreadblockShape::kN / 2) + smem_offset_n / 2) = acc_frag[0];
+      for (int m = 0; m < kAccLoadsM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < kAccLoadsN; ++n) {
+          const int row_idx = m * kWarps + warp_idx;
+          const int col_idx = ((n * (4 * 32) + lane_idx * 4) + 8 * (row_idx % 4)) % ThreadblockShape::kN;  // shift n position the same amount as how we stored it, avoid bank conflict
+          const int offset = row_idx * ThreadblockShape::kN + col_idx;
+          for (int k = 0; k < kKWarps; ++k) {
+            cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.posfix.shared_Acc[k].data() + offset);
+            if (k == 0) {
+              other_acc[m][n] = *smem_ptr;
+            } else {
+              cutlass::Array<float2, 2> tmp;
+              tmp = *smem_ptr;
+              other_acc[m][n][0].x += tmp[0].x;
+              other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, tmp[0].y);
+              other_acc[m][n][1].x += tmp[1].x;
+              other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, tmp[1].y);
+            }
+          }
+        }
       }
-    }
 
-    if constexpr (kKWarps > 1) {
+      // ========================== Store to global memory ==========================
+
+      using half4 = cutlass::Array<__half2, 2>;
+      static_assert(sizeof(half4) == sizeof(b64));
+      auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
+      int output_stride = params.output_byte_stride_ / sizeof(ElementT);
+
+      if (total_k_split == 1) {
+        // No split k, directly store to global memory
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < kAccLoadsM; ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < kAccLoadsN; ++n) {
+            const int row_idx = m_start + m * kWarps + warp_idx;
+            const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+            if (row_idx < m_end && col_idx < tb_n_end) {
+              // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+              b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
+              half4 tmp;
+              tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+              tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+              *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+            }
+          }
+        }
+        continue;  // All done for non-split k
+        // return;  // All done for non-split k
+      }
+
+      uint32_t k_seq = 0;
+      if (threadIdx.x == kThreads - 1) {
+        auto seq = seq_lock.lock(lock_value);
+        // printf("Block %d, %d, %d, seq: %d\n", brick_pos.m, brick_pos.n, brick_pos.k, seq);
+        shared_storage.posfix.block_k_reduction_id[0] = seq;
+      }
       __syncthreads();
-    }
+      k_seq = shared_storage.posfix.block_k_reduction_id[0];
 
-    // ========================== Warp reduction ==========================
-    // Loading TB::kM x TB::kN row major from shared memory.
-    // Each smem load 16 bytes, i.e. 4 floats. Each warp loads 4 x 32 = 128
-    // floats.
-    static_assert(ThreadblockShape::kN >= (4 * 32)); // make math simpler
-    constexpr int kAccLoadsN = ThreadblockShape::kN / (4 * 32);
-    static_assert(ThreadblockShape::kM % kWarps == 0);
-    constexpr int kAccLoadsM = ThreadblockShape::kM / kWarps;
+      float* red_buf = reinterpret_cast<float*>(params.workspace_);
 
-    cutlass::Array<float2, 2> other_acc[kAccLoadsM][kAccLoadsN];
-    CUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < kAccLoadsM; ++m) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < kAccLoadsN; ++n) {
-        const int row_idx = m * kWarps + warp_idx;
-        const int col_idx = ((n * (4 * 32) + lane_idx * 4) + 8 * (row_idx % 4)) % ThreadblockShape::kN;  // shift n position the same amount as how we stored it, avoid bank conflict
-        const int offset = row_idx * ThreadblockShape::kN + col_idx;
-        for (int k = 0; k < kKWarps; ++k) {
-          cutlass::Array<float2, 2>* smem_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(shared_storage.posfix.shared_Acc[k].data() + offset);
-          if (k == 0) {
-            other_acc[m][n] = *smem_ptr;
-          } else {
-            cutlass::Array<float2, 2> tmp;
-            tmp = *smem_ptr;
-            other_acc[m][n][0].x += tmp[0].x;
-            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, tmp[0].y);
-            other_acc[m][n][1].x += tmp[1].x;
-            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, tmp[1].y);
-          }
-        }
-      }
-    }
+      // if (threadIdx.x == 0)
+      //     printf("(%d, %d, %d) seq: %d\n", brick_pos.m, brick_pos.n, brick_pos.k, k_seq);
 
-    // ========================== Store to global memory ==========================
-    const int lock_offset = blockIdx.x * gridDim.y + blockIdx.y;
-    int mm = gridDim.x * ThreadblockShape::kM;
-    int nn = gridDim.y * ThreadblockShape::kN;
-
-    using half4 = cutlass::Array<__half2, 2>;
-    static_assert(sizeof(half4) == sizeof(b64));
-    auto* output_ptr = reinterpret_cast<ElementT*>(params.ptr_output_);
-    int output_stride = params.output_byte_stride_ / sizeof(ElementT);
-    const int tb_m_start = blockIdx.x * ThreadblockShape::kM;
-    const int tb_m_end = min(params.problem_size_.m(), mul_power2<ThreadblockShape::kM>(blockIdx.x + 1));
-    const int tb_n_start = mul_power2<ThreadblockShape::kN>(blockIdx.y);
-    const int tb_n_end = min(params.problem_size_.n(), mul_power2<ThreadblockShape::kN>(blockIdx.y + 1));
-
-    if (params.grid_tiled_shape_.k() == 1) {
-      // No split k, directly store to global memory
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < kAccLoadsM; ++m) {
+      if (k_seq == 0) {
         CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < kAccLoadsN; ++n) {
-          const int row_idx = tb_m_start + m * kWarps + warp_idx;
-          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
-          if (row_idx < tb_m_end && col_idx < tb_n_end) {
-            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
-            half4 tmp;
-            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
-            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+        for (int m = 0; m < kAccLoadsM; ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < kAccLoadsN; ++n) {
+            const int row_idx = m_start + m * kWarps + warp_idx;
+            const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+            if (row_idx < m_end && col_idx < tb_n_end) {
+              // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+              float* dst = red_buf + row_idx * grid_n + col_idx;
+              *reinterpret_cast<cutlass::Array<float2, 2>*>(dst) = other_acc[m][n];
+            }
           }
         }
-      }
-      return;  // All done for non-split k
-    }
-
-    //
-    // We have split k dimension into multiple blocks, we need to do reduction via global memory
-    //
-    auto* split_k_locks = reinterpret_cast<b64*>(params.workspace_ + mm * nn * sizeof(float));
-
-    SeqLock seq_lock(split_k_locks + lock_offset, params.grid_tiled_shape_.k());
-
-    uint32_t k_seq = 0;
-    if (threadIdx.x == kThreads - 1) {
-      auto seq = seq_lock.lock();
-      // printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
-      shared_storage.posfix.block_k_reduction_id[0] = seq;
-    }
-    __syncthreads();
-    k_seq = shared_storage.posfix.block_k_reduction_id[0];
-
-    float* red_buf = reinterpret_cast<float*>(params.workspace_);
-
-    // if (threadIdx.x == 0)
-    //     printf("(%d, %d, %d) seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, k_seq);
-
-    if (k_seq == 0) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < kAccLoadsM; ++m) {
+      } else if (k_seq == total_k_split - 1){
         CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < kAccLoadsN; ++n) {
-          const int row_idx = tb_m_start + m * kWarps + warp_idx;
-          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
-          if (row_idx < tb_m_end && col_idx < tb_n_end) {
-            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-            float* dst = red_buf + row_idx * nn + col_idx;
-            *reinterpret_cast<cutlass::Array<float2, 2>*>(dst) = other_acc[m][n];
+        for (int m = 0; m < kAccLoadsM; ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < kAccLoadsN; ++n) {
+            const int row_idx = m_start + m * kWarps + warp_idx;
+            const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+            if (row_idx < m_end && col_idx < tb_n_end) {
+              // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+              auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * grid_n + col_idx);
+              cutlass::Array<float2, 2> partial = *partial_ptr;
+              other_acc[m][n][0].x += partial[0].x;
+              other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
+              other_acc[m][n][1].x += partial[1].x;
+              other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
+
+              b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
+              half4 tmp;
+              tmp[0] = __float22half2_rn(other_acc[m][n][0]);
+              tmp[1] = __float22half2_rn(other_acc[m][n][1]);
+              *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+            }
           }
         }
-      }
-    } else if (k_seq == params.grid_tiled_shape_.k() - 1){
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < kAccLoadsM; ++m) {
+      } else {
         CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < kAccLoadsN; ++n) {
-          const int row_idx = tb_m_start + m * kWarps + warp_idx;
-          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
-          if (row_idx < tb_m_end && col_idx < tb_n_end) {
-            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-            auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * nn + col_idx);
-            cutlass::Array<float2, 2> partial = *partial_ptr;
-            other_acc[m][n][0].x += partial[0].x;
-            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
-            other_acc[m][n][1].x += partial[1].x;
-            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
-
-
-            b64* dst_ptr = reinterpret_cast<b64*>(output_ptr + row_idx * output_stride + col_idx);
-            half4 tmp;
-            tmp[0] = __float22half2_rn(other_acc[m][n][0]);
-            tmp[1] = __float22half2_rn(other_acc[m][n][1]);
-            *dst_ptr = *reinterpret_cast<b64*>(&tmp);
+        for (int m = 0; m < kAccLoadsM; ++m) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < kAccLoadsN; ++n) {
+            const int row_idx = m_start + m * kWarps + warp_idx;
+            const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
+            if (row_idx < m_end && col_idx < tb_n_end) {
+              // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
+              auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * grid_n + col_idx);
+              cutlass::Array<float2, 2> partial = *partial_ptr;
+              other_acc[m][n][0].x += partial[0].x;
+              other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
+              other_acc[m][n][1].x += partial[1].x;
+              other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
+              *partial_ptr = other_acc[m][n];
+            }
           }
         }
       }
-    } else {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < kAccLoadsM; ++m) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < kAccLoadsN; ++n) {
-          const int row_idx = tb_m_start + m * kWarps + warp_idx;
-          const int col_idx = tb_n_start + n * (4 * 32) + lane_idx * 4;
-          if (row_idx < tb_m_end && col_idx < tb_n_end) {
-            // printf("%2d, %2d, (%2d, %2d)\n", warp_idx, lane_idx, row_idx, col_idx);
-            auto* partial_ptr = reinterpret_cast<cutlass::Array<float2, 2>*>(red_buf + row_idx * nn + col_idx);
-            cutlass::Array<float2, 2> partial = *partial_ptr;
-            other_acc[m][n][0].x += partial[0].x;
-            other_acc[m][n][0].y = __fmaf_rn(other_acc[m][n][0].y, 1.0f, partial[0].y);
-            other_acc[m][n][1].x += partial[1].x;
-            other_acc[m][n][1].y = __fmaf_rn(other_acc[m][n][1].y, 1.0f, partial[1].y);
-            *partial_ptr = other_acc[m][n];
-          }
-        }
-      }
-    }
 
-    __syncthreads();
-    if (threadIdx.x == kThreads - 1) {
-      seq_lock.unlock();
-    }
-  }
+      __syncthreads();
+      if (threadIdx.x == kThreads - 1) {
+        seq_lock.unlock();
+      }
+    }  // for each sequence of k bricks
+  }  // operator()
 };
 
 
