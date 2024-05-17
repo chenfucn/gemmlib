@@ -297,9 +297,9 @@ TEST(QuantB4Gemm, PackedBTest) {
   // test_quantb4_gemm<cutlass::MatrixShape<1, 128>, cutlass::gemm::GemmShape<16, 32, 32>, 8, 3>(70, 128, 4096 + 16);
   // test_quantb4_gemm<cutlass::MatrixShape<64, 1>, cutlass::gemm::GemmShape<64, 32, 32>, 2, 2>(70, 48, 64 * 7);
 
-  // test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 1, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
   test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 1, 4>(68, 256 * 2 + 32, 64 * 5 + 16);
-  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 4, 3>(68, 256 * 2 + 32, 64 * 20 + 16);
+  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 8, 3>(68, 256 * 2 + 32, 64 * 30 + 16);
+  test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<32, 256, 64>, 8, 3>(32, 4096, 4096);
 
   // test_quantb4_gemm<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<64, 64, 128>, 1, 4>(68, 160, 4096 + 16);
   // test_quantb4_gemm<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<128, 128, 128>, 1, 2>(170, 176, 2048 + 32);

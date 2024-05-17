@@ -36,7 +36,7 @@ struct SeqLock {
   static constexpr uint32_t kUnlocked = 0xa7b6c536;
   static constexpr uint32_t kLocked = kUnlocked + 1;
   static constexpr uint32_t kSeqStart = kUnlocked + 2;
-  static constexpr b64 kInit = b64(kSeqStart) << 32 | kUnlocked;
+  static constexpr b64 kInit = b64(kSeqStart) << 32 | kLocked;
 
   const uint32_t max_k_;  // max number of competing threads
   uint32_t count_{kSeqStart - 2};     // sequence number
@@ -65,7 +65,9 @@ struct SeqLock {
     // There are 2 * max_k_ valid values among 2^64 possible ones.
     // This implementation considers the chance of uninitialized memory
     // to be valid is negligible.
-    b64 fetched = *reinterpret_cast<b64*>(address_);
+    b64 fetched;
+    asm volatile ("ld.global.acquire.gpu.b64 %0, [%1];\n" : "=l"(fetched) : "l"(address_));
+
     if (!valid(fetched, max_k_)) {
       // Unintialized memory, attempt to initialize it
       auto old = atomicCAS(reinterpret_cast<b64*>(address_), fetched, kInit);
@@ -74,7 +76,9 @@ struct SeqLock {
         fetched = old;
       } else {
         // Successfully initialized
-        fetched = kInit;
+        // fetched = kInit;
+        count_ = kSeqStart;
+        return 0;
       }
     }
 
@@ -85,14 +89,12 @@ struct SeqLock {
     }
 
     uint32_t old_lock_val;
-    int spin_cnt = 0;
+    // int spin_cnt = 0;
     do {
-      if (spin_cnt++ > 2000) {
-        // spin_cnt is used to avoid infinite loop
-        // if the lock is not released by the owner
-        printf("Spin count %d, fetched %x\n", spin_cnt, old_lock_val);
-        assert(spin_cnt < 2000);
-      }
+      // if (spin_cnt++ > 2000) {
+      //   printf("Spin count %d, fetched %x\n", spin_cnt, old_lock_val);
+      //   assert(spin_cnt <= 2000);
+      // }
       old_lock_val = atomicCAS(reinterpret_cast<uint32_t*>(address_), kUnlocked, kLocked);
     } while (old_lock_val != kUnlocked);
 
@@ -107,12 +109,11 @@ struct SeqLock {
     b64 unlocked = kUnlocked | (b64(count_ + 1) << 32); 
     b64 old = atomicExch(address_, unlocked);
     assert((old & 0xffffffff) == kLocked && old >> 32 == count_);
+    if ((count_ - kSeqStart) == (max_k_ - 1)) {
+      b64 fetched = *address_;
+      assert(!valid(fetched, max_k_));
+    }
     count_ = kSeqStart - 1;
-  }
-
-  CUTLASS_DEVICE
-  void clear() {
-    *address_ = kInit;
   }
 
 };
@@ -804,15 +805,13 @@ struct QuantB4Gemm {
     SeqLock seq_lock(split_k_locks + lock_offset, params.grid_tiled_shape_.k());
 
     uint32_t k_seq = 0;
-    if (params.grid_tiled_shape_.k() > 1) {
-      if (threadIdx.x == kThreads - 1) {
-        auto seq = seq_lock.lock();
-        // printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
-        shared_storage.posfix.block_k_reduction_id[0] = seq;
-      }
-      __syncthreads();
-      k_seq = shared_storage.posfix.block_k_reduction_id[0];
+    if (threadIdx.x == kThreads - 1) {
+      auto seq = seq_lock.lock();
+      // printf("Block %d, %d, %d, seq: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seq);
+      shared_storage.posfix.block_k_reduction_id[0] = seq;
     }
+    __syncthreads();
+    k_seq = shared_storage.posfix.block_k_reduction_id[0];
 
     float* red_buf = reinterpret_cast<float*>(params.workspace_);
 
@@ -879,14 +878,9 @@ struct QuantB4Gemm {
       }
     }
 
-    if (params.grid_tiled_shape_.k() > 1) {
-      __syncthreads();
-      if (threadIdx.x == kThreads - 1) {
-        seq_lock.unlock();
-        if (k_seq == params.grid_tiled_shape_.k() - 1) {
-          seq_lock.clear();
-        }
-      }
+    __syncthreads();
+    if (threadIdx.x == kThreads - 1) {
+      seq_lock.unlock();
     }
   }
 };
