@@ -325,7 +325,7 @@ class SwizzleTileLoader<SmemDimM_, 128, NumThreads_> {
         int mn_end,            ///< End position in the M or N dimension
         int k_start,           ///< Starting position in the K dimension
         int k_end,             ///< End position in the K dimension
-        unsigned int thread_id) ///< ID of each participating thread
+        int thread_id)         ///< ID of each participating thread
     : stride_(byte_stride) {
     #ifndef NDEBUG
         bool assertion_pass = true;

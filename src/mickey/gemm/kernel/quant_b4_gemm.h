@@ -313,7 +313,6 @@ struct QuantB4Gemm {
     }
 
     if constexpr (kSplitK > 1){
-      // TODO! Use thread block shape
       if (params.gemm_k_size_ < ThreadblockShape::kK * kStages + 2) {
         // spliting too small, may not get enough iterations to rampup pipeline
         std::cerr << "QuantB4Gemm validation fail: kSplitK is too small, k: " << params.gemm_k_size_ << " is smaller than " << (ThreadblockShape::kK * kStages + 2) << std::endl;
@@ -390,7 +389,7 @@ struct QuantB4Gemm {
       params.a_byte_stride_,
       m_start, m_end,
       mul_power2<kElementSize>(k_start), mul_power2<kElementSize>(k_end), // convert to byte based index
-      threadIdx.x};
+      (int)threadIdx.x};
 
     //
     // Prologue: start loading from global memory to shared memory

@@ -22,6 +22,7 @@
 // #include "helper.h"
 
 #include "gemm/kernel/quant_b4_gemm.h"
+#include "gemm/kernel/quant_b4_narrow_gemm.h"
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,68 +116,6 @@ struct Options {
   }
 };
 
-template <
-  typename QuantBlocking_,              ///! Shape of the quantization block, either 1xb or bx1
-  typename ThreadblockShape_,                  ///! Warp-scoped matrix multiply-accumulate
-  int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
-  int Stages_ = 4                       ///! Stages of the pipelined mainloop
->
-class QuantB4GemmTestDevKernel {
- public:
-  using QuantBlocking = QuantBlocking_;
-  using ThreadblockShape = ThreadblockShape_;
-  static constexpr int kSplitK = SplitKSerial_;
-  static constexpr int kStages = Stages_;
-
-  using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, kSplitK, kStages>;
-  using Args = typename TestKernel::Params;
-
-  cutlass::Status run(
-    cudaStream_t stream,
-    cutlass::gemm::GemmCoord const & problem_size,
-    void* ptr_output,
-    int output_byte_stride,
-    void const *ptr_a,
-    int a_byte_stride,
-    void const *ptr_packed_b,
-    int b_byte_stride,
-    void const *ptr_scales,
-    int scales_byte_stride) {
-
-    Args args(problem_size, ptr_output, output_byte_stride,
-              ptr_a, a_byte_stride, ptr_packed_b, b_byte_stride,
-              ptr_scales, scales_byte_stride);
-    cutlass::Status status = TestKernel::can_implement(args);
-    if (status != cutlass::Status::kSuccess) {
-      return status;
-    }
-
-    dim3 grid(args.grid_tiled_shape_.m(), args.grid_tiled_shape_.n(), args.grid_tiled_shape_.k());
-    dim3 block(TestKernel::kThreadCount, 1, 1);
-
-    cudaError_t result;
-
-    int smem_size = int(sizeof(typename TestKernel::SharedStorage));
-
-    if (smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(cutlass::Kernel<TestKernel>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    smem_size);
-
-      if (result != cudaSuccess) {
-        std::cerr << "Failed to obtain maximum shared memory size " << smem_size << " for kernel: "
-                  << cudaGetErrorString(result) << "\n";
-        return cutlass::Status::kErrorInternal;
-      }
-    }
-   
-    cutlass::Kernel<TestKernel><<<grid, block, smem_size, stream>>>(args);
-
-    return cutlass::Status::kSuccess;
-  }
-};
-
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 using QuantBlocking = cutlass::MatrixShape<1,32>;   // <- weights block per scale (1,16/32/64), (16/32/64,1)
@@ -187,12 +126,12 @@ using LayoutQMeta =
         cutlass::layout::ColumnMajor,
         cutlass::layout::RowMajor>::type;
 
-using ThreadblockShape = cutlass::gemm::GemmShape<32, 256, 64>;
 // Number of pipelines you want to use
 constexpr int NumStages = 3;
-constexpr int NumSplitK = 8;
+constexpr int NumSplitK = 1;
 
-using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, ThreadblockShape, NumSplitK, NumStages>;
+using TestKernel = mickey::gemm::kernel::QuantB4Gemm<QuantBlocking, false, cutlass::gemm::GemmShape<32, 256, 64>, NumSplitK, NumStages>;
+// using TestKernel = mickey::gemm::kernel::QuantB4NarrowGemm<QuantBlocking, false, cutlass::gemm::GemmShape<16, 16, 64>, NumSplitK, NumStages>;
 using Args = typename TestKernel::Params;
 
 int run(Options &options) {

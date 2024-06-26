@@ -30,7 +30,7 @@
 #include "blkq4_fp16_util.h"
 #include "blkq4_fp16_gemm_sm80.h"
 
-#include "gemm/warp/swizzle_tile_loader.h"
+#include "gemm/warp/tensor_core_tile_loader.h"
 #include "gemm/warp/quantb_meta_loader.h"
 
 #include "gtest/gtest.h"
@@ -78,30 +78,15 @@ struct SwizzleDequantTestKernel {
     "Weight B is packed as 16x16 tiles, warp shape must contain whole tiles!");
   using WarpPackedBShape = cutlass::gemm::GemmShape<1, WarpShape::kN/2, WarpShape::kK>;
 
-  using PackedBLoader = mickey::gemm::warp::SwizzleTileLoader<WarpPackedBShape::kN, WarpPackedBShape::kK>;
-  // // decide per warp tile loader shape, it loads 1, 2 or 4 tiles at a time
-  // static constexpr int kNTilesPerLoad = std::min(4, WarpPackedBShape::kN / 8);
-  // static constexpr int kKTilesPerLoad = std::min(4/kNTilesPerLoad, WarpPackedBShape::kK / 16);
-  // using PackedBLoader = mickey::gemm::warp::TensorCoreTileLoader<kNTilesPerLoad, kKTilesPerLoad>;
-
-  // static constexpr int kB_Nloads = WarpPackedBShape::kN / PackedBLoader::kMNStride;
-  // static constexpr int kB_Kloads = WarpPackedBShape::kK / PackedBLoader::kKStride;
+  using PackedBLoader = mickey::gemm::warp::TensorCoreTileLoader<WarpShape, WarpShape::kK>;
 
   using MetaLoader = mickey::gemm::warp::QuantBScaleLoader<QuantBlocking, WarpShape, ElementT, false>;
 
-  // Since int4 weights are packed (16x16) -> (8x8), each tile is expanded to 4 tiles when
-  // de-quantized to 16b float.
-
-  // Most of the time we want to use load_fragment_k32 to load a ribbon of (kN, 32)
-  // elements. But when kN is 8, (8,32) only has 2 tiles, so we use load_fragment_k64
-  // to load 4 tiles, fully utilize the ldmatrix instruction.
-  static constexpr int kFragPackedBStrideK = WarpPackedBShape::kN == 8 ? 64 : 32;
-
   // Need 4 tiles to fully utilize ldmatrix. And.....
-  // PackedB is packing 4 tiles of int4 weights into 1 tile of 16b:
+  // PackedB is packing 4 tiles of int4 weights into 1 tile of 16b in the following layout:
   //     0  2
   //     1  3    (column major, k is the vertical dimension)
-  // When load 4 16b tiles in one shot, we have either 8x64, when de-quantized:
+  // When load 4 16b tiles in one shot, we have either 16x64, when de-quantized:
   //     0  2
   //     1  3        This can be easily break into 4 k (stride 16) iterations,
   //     4  6        each k iterations contains 2 n iterations, which fits
@@ -111,24 +96,20 @@ struct SwizzleDequantTestKernel {
   //    12 14
   //    13 15
   //
-  // Or 16x32, when de-quantized:
+  // Or 32x32, when de-quantized:
   //     0  2  4  6
   //     1  3  5  7   This can also be easily break into 4 k (stride 16)
   //     8 10 12 14   iterations, each k iterations contains 4 n iterations
   //     9 11 13 15
   //
-  // But if use ldmatrix multiple times, we end up with:
-  //     0  2  4  6    16 18 20 22
-  //     1  3  5  7    17 19 21 23    This is difficult to loop around
-  //     8 10 12 14    24 26 28 30
-  //     9 11 13 15    25 27 29 31
-  //
-  static_assert(PackedBLoader::kTiles == 4);
+  // Here kFragPackedBStrideK is the stride of B fragment in K dimension,
+  // (kN = 16) ==> 64;  (kN = 32) ==> 32; (kN = 64) ==> 16
+  static constexpr int kFragPackedBStrideK = PackedBLoader::kStrideKPerLoad;
 
   // Fragments of quantized weights
   using FragmentPackedB = cutlass::Array<
       unsigned,  // 8 of int4 weights each tile (becomes 4 tiles when de-quantized)
-      PackedBLoader::kTiles>;
+      4>;        // Each warp loads 4 tiles of int4 weights at a time
 
   // Fragments for operand B, each tile has 2 elements per thread. In each iteration, we use a
   // (16, WarpShape::kN) block for mma, i.e. (WarpShape::kN / 8) * 2 tiles
@@ -189,7 +170,7 @@ struct SwizzleDequantTestKernel {
   /// Shared memory storage structure
   struct SharedStorage {
     /// Buffer for prepacked weights
-    static constexpr int kPackedBSizePerIter = PackedBLoader::kBlockSize;
+    static constexpr int kPackedBSizePerIter = PackedBLoader::kByteSize;
     static constexpr int kPackedBSizePerWarp = kPackedBSizePerIter * kStages;
     static constexpr int kPackedBSize = kPackedBSizePerWarp * kWarps;
     cutlass::AlignedBuffer<uint8_t, kPackedBSize> operand_B;
@@ -216,12 +197,12 @@ struct SwizzleDequantTestKernel {
       std::cerr << "SwizzleDequantTestKernel validation fail: partial quantization block not supported!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
-    if (reinterpret_cast<uintptr_t>(params.ptr_packed_b_) % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_packed_b_ is not aligned to 16 bytes!" << std::endl;
+    if (reinterpret_cast<uintptr_t>(params.ptr_packed_b_) % 128) {
+      std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_packed_b_ is not aligned to 128 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
-    if (params.b_byte_stride_ % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.b_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+    if (params.b_byte_stride_ % 128) {
+      std::cerr << "SwizzleDequantTestKernel validation fail: params.b_byte_stride_ is not aligned to 128 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (reinterpret_cast<uintptr_t>(params.ptr_scales_) % 16) {
@@ -264,7 +245,7 @@ struct SwizzleDequantTestKernel {
       std::cerr << "SwizzleDequantTestKernel validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
-    if (params.problem_size_.k() > params.b_byte_stride_) {
+    if (params.problem_size_.k() > (params.b_byte_stride_ / 8)) {
       std::cerr << "SwizzleDequantTestKernel validation fail: params.problem_size_.k() is greater than params.b_byte_stride_!" << std::endl;
       // for gemm of 16b floats, weights is packed to shape (k/2,n/2), column major
       // so stride should be greater or equal to k/2, with element size 2, it should be k
@@ -335,8 +316,6 @@ struct SwizzleDequantTestKernel {
     //
     const int n_start = blockIdx.y * WarpShape::kN;   // TODO! change to thread block shape
     const int n_end = min(params.problem_size_.n(), (blockIdx.y + 1) * WarpShape::kN);
-    const int packed_n_start = (n_start) / 2;
-    const int packed_n_end = n_end / 2;
   
     const int k_start = warp_idx_k * params.gemm_k_size_;
     const int k_end = min(params.problem_size_.k(), (warp_idx_k + 1) * params.gemm_k_size_);
@@ -344,8 +323,8 @@ struct SwizzleDequantTestKernel {
     PackedBLoader packed_b_loader{
       params.ptr_packed_b_,
       params.b_byte_stride_,
-      packed_n_start,
-      packed_n_end,
+      n_start,
+      n_end,
       k_start,
       k_end,
       lane_idx};
@@ -358,8 +337,8 @@ struct SwizzleDequantTestKernel {
 
     if constexpr (kDebugPrint) {
       if (lane_idx == 0) {
-        printf("Warp: %d, k_start %d, k_end %d, packed_n_start %d, packed_n_end %d\n",
-          warp_idx, k_start, k_end, packed_n_start, packed_n_end);
+        printf("Warp: %d, k_start %d, k_end %d, n_start %d, n_end %d\n",
+          warp_idx, k_start, k_end, n_start, n_end);
       }
     }
 
@@ -367,8 +346,8 @@ struct SwizzleDequantTestKernel {
     int proc_k = k_start; // current k index for reading from shared memory and processing
     int smem_write_stage = 0;
     int smem_read_stage = 0;
-    uint8_t* packed_b_shared_ptr = shared_storage.operand_B.data() + 
-      SharedStorage::kPackedBSizePerWarp * warp_idx;
+    uint8_t* packed_b_shared_ptr = packed_b_loader.get_smem_lane_ptr(shared_storage.operand_B.data() + 
+        SharedStorage::kPackedBSizePerWarp * warp_idx, lane_idx);
 
     ElementT* shared_scale_ptr = shared_storage.shared_Scale.data() + SharedStorage::kMetaSizePerWarp * warp_idx;
 
@@ -383,9 +362,8 @@ struct SwizzleDequantTestKernel {
       meta_loader.load_to_smem(lane_idx, load_k, min(k_end - load_k, WarpShape::kK), scale_smem_ptr);
 
       // Load packed b
-      packed_b_loader.load_to_smem(lane_idx, packed_b_smem_ptr);
+      packed_b_loader.load_to_smem(packed_b_smem_ptr);
       ++packed_b_loader;
-      packed_b_smem_ptr += PackedBLoader::kBlockSize;
 
       // Defines the boundary of a stage of cp.async.
       cutlass::arch::cp_async_fence();
@@ -403,7 +381,6 @@ struct SwizzleDequantTestKernel {
     }
 
     constexpr int kMmaIterations = WarpShape::kK / InstructionShape::kK;
-    constexpr int kPackBGloadsPerIter = mickey::div_up(PackedBLoader::kGloadSplit, kMmaIterations);
 
     //
     // Mainloop
@@ -422,22 +399,15 @@ struct SwizzleDequantTestKernel {
 
       meta_loader.process(fragment_scales, fragment_addon);
 
+      packed_b_loader.load_to_smem(packed_b_smem_write_ptr);
+      ++packed_b_loader;
+
       // Load from shared memory to fragments/registers, and compute mma, 16 k at a time, dictated by Ampere mma shape
       CUTLASS_PRAGMA_UNROLL
       for (int warp_k_offset = 0; warp_k_offset < WarpShape::kK; warp_k_offset += InstructionShape::kK) {
         // Load packed weights. They are smaller in size, so they are loaded in bigger blocks
         if ((warp_k_offset % kFragPackedBStrideK) == 0) {
-          if constexpr (kFragPackedBStrideK == 32) {
-            packed_b_loader.load_fragment_k32(lane_idx, packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
-          } else {
-            static_assert(kFragPackedBStrideK == 32 || kFragPackedBStrideK == 64);
-            packed_b_loader.load_fragment_k64(lane_idx, packed_b_smem_read_ptr, warp_k_offset, fragment_packed_b.data());
-          }
-        }
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kPackBGloadsPerIter; ++i) {
-          packed_b_loader.load_to_smem_split(lane_idx, packed_b_smem_write_ptr, i + (warp_k_offset / InstructionShape::kK) * kPackBGloadsPerIter);
+          PackedBLoader::load_to_register(lane_idx, warp_k_offset/16, packed_b_smem_read_ptr, fragment_packed_b);
         }
 
         // Dequantize weights block (16, WarpShape::kN)
@@ -466,8 +436,6 @@ struct SwizzleDequantTestKernel {
 
       // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
       cutlass::arch::cp_async_wait<kStages - 2>();
-      //__syncthreads(); is this necessary since the loader is warp based?
-      ++packed_b_loader;
       load_k += WarpShape::kK;
 
       if constexpr(kDebugPrint) {
@@ -591,9 +559,10 @@ void test_swizzle_dequant(int m, int n, int k) {
 
   std::vector<uint8_t> packed_w_ref(k * n / 2);
   mickey::MatrixRef<uint8_t, cutlass::layout::ColumnMajor, true> tensor_packed_w_ref(
-      packed_w_ref, cutlass::make_Coord(k, n / 2));
-  onnxruntime::cuda::test::prepack_weights_ref(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
+      packed_w_ref, cutlass::make_Coord(k * (128 / 16), n / 16));
+  onnxruntime::cuda::test::pack_q4_128b(k, n, onnxruntime::test::make_ConstMatrixRef(q4_weights), tensor_packed_w_ref);
 
+  int packed_b_stride = tensor_packed_w_ref.stride(0);
   int meta_tensor_stride = scales.stride(0);
   thrust::device_vector<cutlass::half_t> packed_scale_dev;
 
@@ -622,7 +591,7 @@ void test_swizzle_dequant(int m, int n, int k) {
   ASSERT_EQ(dequant_stride, problem_size.n());
   cutlass::Status status = test.run(nullptr, problem_size,
                                     tensor_b.device_data(), dequant_stride * sizeof(cutlass::half_t),
-                                    thrust::raw_pointer_cast(packed_w_dev.data()), problem_size.k(),
+                                    thrust::raw_pointer_cast(packed_w_dev.data()), packed_b_stride,
                                     thrust::raw_pointer_cast(packed_scale_dev.data()), meta_tensor_stride * sizeof(cutlass::half_t));
   ASSERT_EQ(status, cutlass::Status::kSuccess);
   tensor_b.sync_host();

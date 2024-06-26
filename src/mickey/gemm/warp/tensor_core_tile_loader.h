@@ -26,23 +26,16 @@ namespace warp {
  * @brief Load packed quantized int4 matrix tiles from global memory to shared memory.
  *        Dimensions are of the dequantized (fp16) tiles.
  *        WarpShape::kM is ignored, using kN and kK to specify B dimension only.
+ * 
+ *        Tested shapes: (M, 16, 64), (M, 32, 32), (M, 64, 32)
 */
 template <typename WarpShape_, int TBStrideK_>
-class TensorCoreTileLoader;
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// Specialization for ?x64x? tiles. kDimM is ignored.
-template <
-    int kDimM_,
-    int kDimK_,
-    int TBStrideK_>
-class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrideK_> {
+class TensorCoreTileLoader {
  public:
-  static constexpr int kDimM = kDimM_;
-  static constexpr int kDimN = 64;
-  static constexpr int kDimK = kDimK_;
-  using WarpShape = cutlass::gemm::GemmShape<kDimM, kDimN, kDimK>;
+  using WarpShape = WarpShape_;
   static constexpr int kThreadBlockStrideK = TBStrideK_;
+
+  static_assert(WarpShape::kN == 16 || WarpShape::kN == 32 || WarpShape::kN == 64);
   static_assert(WarpShape::kK % 16 == 0); // packing restriction
   static_assert(kThreadBlockStrideK % WarpShape::kK == 0);
 
@@ -62,20 +55,26 @@ class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrid
   static constexpr int kBlkDim = 16;
   static constexpr int kCacheLineSize = 128;
   static constexpr int kAccessSize = 16;  // cp.async 16 bytes at a time
+  static constexpr int kThreadsPerCacheLine = kCacheLineSize / kAccessSize; // 8 threads per cache line/block
   static constexpr int kThreads = 32;     // 32 threads in a warp
-  static constexpr int kNBlks = kDimN / kBlkDim;
-  static constexpr int kKBlks = WarpShape::kK / kBlkDim;
+
+  static constexpr int kNBlks = WarpShape::kN / kBlkDim;  // number of blocks in N dimension
+  static constexpr int kKBlks = WarpShape::kK / kBlkDim;  // number of blocks in K dimension
   static constexpr int kNumBlks = kNBlks * kKBlks;
   static constexpr int kByteSize = kNumBlks * kCacheLineSize;
-  static constexpr int kThreadsPerCacheLine = kCacheLineSize / kAccessSize;
+
+  // A warp loads 4 cache lines at a time, this requires the warp shape to be
+  // (16, 64), (32, 32), (64, 16), or multiple of these
+  static_assert(kNumBlks % 4 == 0); 
 
   // each cp_async loads of the participating threads must load entire N width
   static constexpr int kKBlksPerLoad = kThreads / (kThreadsPerCacheLine * kNBlks);
+  static constexpr int kStrideKPerLoad = kKBlksPerLoad * kBlkDim;
   static constexpr int kLoads = kKBlks / kKBlksPerLoad;
   static_assert(kThreadsPerCacheLine * kNBlks * kKBlksPerLoad == kThreads);
 
-  // Register to store tile shaped (16, WarpShape::kN)
-  using Fragment = cutlass::Array<uint32_t, kNBlks>;
+  // Register to store loaded tiles
+  using Fragment = cutlass::Array<uint32_t, 4>;
 
  private:
     /// Pointer to global memory to load data from
@@ -84,7 +83,7 @@ class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrid
 
     /// Stride in bytes to advance to next row in n dimension
     const int stride_;
-    
+
  public:
 
   CUTLASS_HOST_DEVICE
@@ -126,7 +125,7 @@ class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrid
         printf("Not well formed k_start: %d and k_end %d!\n", k_start, k_end);
       }
     }
-    if (n_start % kDimN != 0 || n_end % kBlkDim != 0) {
+    if ((n_start % WarpShape::kN) != 0 || (n_end % kBlkDim) != 0) {
       assertion_pass = false;
       if (lane_id == 0) {
         printf("Not well formed n_start: %d and n_end %d!\n", n_start, n_end);
@@ -194,20 +193,11 @@ class TensorCoreTileLoader<cutlass::gemm::GemmShape<kDimM_, 64, kDimK_>, TBStrid
   CUTLASS_DEVICE
   static void load_to_register(int lane_id, int k_iter, uint8_t const* smem_lane_ptr, Fragment& reg) {
     assert(k_iter < kKBlks);
+    assert((k_iter % kKBlksPerLoad) == 0);
     assert(lane_id >= 0 && lane_id < 32);
 
-    constexpr int kWarpLoads = Fragment::kElements / 4;
-    static_assert(kWarpLoads == kNBlks * kThreadsPerCacheLine / 32);
-    using T4 = cutlass::Array<uint32_t, 4>;
-
     uint8_t const* smem_ptr = smem_lane_ptr + k_iter * kNBlks * kCacheLineSize;
-    T4* frag_ptr = reinterpret_cast<T4*>(reg.data());
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kWarpLoads; ++i) {
-      cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(*frag_ptr, smem_ptr);
-      smem_ptr += 32 * kAccessSize;
-      frag_ptr++;
-    }
+    cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(reg, smem_ptr);
   }
 
 };
