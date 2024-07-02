@@ -2,7 +2,7 @@
  * Copyright (c) Microsoft.
  * Licensed under the MIT license.
  *
- * @file swizzle_dequant_test.cu
+ * @file narrow_dequant_test.cu
  * 
  * Unit test for loading packed int4 weights with swizzle loader
  * and dequantize them to fp16
@@ -50,7 +50,7 @@ template <
   int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
   int Stages_ = 4                       ///! Stages of the pipelined mainloop
 >
-struct SwizzleDequantTestKernel {
+struct NarrowDequantTestKernel {
  public:
   //
   // Type definitions
@@ -188,65 +188,65 @@ struct SwizzleDequantTestKernel {
   //
 
   CUTLASS_HOST_DEVICE
-  SwizzleDequantTestKernel() { }
+  NarrowDequantTestKernel() { }
 
   /// Determines whether kernel satisfies alignment
   static cutlass::Status can_implement(const Params &params) {
     if ((params.problem_size_.k() % QuantBlocking::kRow != 0) ||
         (params.problem_size_.n() % QuantBlocking::kColumn) != 0){
-      std::cerr << "SwizzleDequantTestKernel validation fail: partial quantization block not supported!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: partial quantization block not supported!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
     if (reinterpret_cast<uintptr_t>(params.ptr_packed_b_) % 128) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_packed_b_ is not aligned to 128 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.ptr_packed_b_ is not aligned to 128 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.b_byte_stride_ % 128) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.b_byte_stride_ is not aligned to 128 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.b_byte_stride_ is not aligned to 128 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (reinterpret_cast<uintptr_t>(params.ptr_scales_) % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_scales_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.ptr_scales_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.scales_byte_stride_ % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.scales_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.scales_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if constexpr (has_quant_offset) {
       if (params.ptr_offsets_ == nullptr || params.offsets_byte_stride_ == 0) {
-        std::cerr << "SwizzleDequantTestKernel validation fail: Required quantization offsets are not provided!" << std::endl;
+        std::cerr << "NarrowDequantTestKernel validation fail: Required quantization offsets are not provided!" << std::endl;
         return cutlass::Status::kErrorInvalidProblem;
       }
       if (reinterpret_cast<uintptr_t>(params.ptr_offsets_) % 16) {
-        std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_offsets_ is not aligned to 16 bytes!" << std::endl;
+        std::cerr << "NarrowDequantTestKernel validation fail: params.ptr_offsets_ is not aligned to 16 bytes!" << std::endl;
         return cutlass::Status::kErrorMisalignedOperand;
       }
       if (params.offsets_byte_stride_ % 16) {
-        std::cerr << "SwizzleDequantTestKernel validation fail: params.offsets_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+        std::cerr << "NarrowDequantTestKernel validation fail: params.offsets_byte_stride_ is not aligned to 16 bytes!" << std::endl;
         return cutlass::Status::kErrorMisalignedOperand;
       }
     } else {
       if (params.ptr_offsets_ != nullptr || params.offsets_byte_stride_ != 0) {
-        std::cerr << "SwizzleDequantTestKernel validation fail: quantization offsets are provided to scale only kernel!" << std::endl;
+        std::cerr << "NarrowDequantTestKernel validation fail: quantization offsets are provided to scale only kernel!" << std::endl;
         return cutlass::Status::kErrorInvalidProblem;
       }
     }
 
     if (reinterpret_cast<uintptr_t>(params.ptr_output_) % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.ptr_output_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.ptr_output_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.output_byte_stride_ % 16) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.output_byte_stride_ is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.output_byte_stride_ is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorMisalignedOperand;
     }
     if (params.problem_size_.k() % 16 != 0) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.problem_size_.k() is not aligned to 16 bytes!" << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
     if (params.problem_size_.k() > (params.b_byte_stride_ / 8)) {
-      std::cerr << "SwizzleDequantTestKernel validation fail: params.problem_size_.k() is greater than params.b_byte_stride_!" << std::endl;
+      std::cerr << "NarrowDequantTestKernel validation fail: params.problem_size_.k() is greater than params.b_byte_stride_!" << std::endl;
       // for gemm of 16b floats, weights is packed to shape (k/2,n/2), column major
       // so stride should be greater or equal to k/2, with element size 2, it should be k
       return cutlass::Status::kErrorInvalidProblem;
@@ -257,7 +257,7 @@ struct SwizzleDequantTestKernel {
       int remain = params.problem_size_.k() % params.gemm_k_size_;
       if (remain > 0 && remain < WarpShape::kK * kStages * 2) {
         // spliting too small, may not get enough iterations to rampup pipeline
-        std::cerr << "SwizzleDequantTestKernel validation fail: kSplitK is too small, k: " << remain << " is smaller than " << (WarpShape::kK * kStages * 4) << std::endl;
+        std::cerr << "NarrowDequantTestKernel validation fail: kSplitK is too small, k: " << remain << " is smaller than " << (WarpShape::kK * kStages * 4) << std::endl;
         return cutlass::Status::kErrorNotSupported;
       }
     }
@@ -457,14 +457,14 @@ template <
   int SplitKSerial_ = 1,                ///! How many warps to split the K dimension in the same MxN block
   int Stages_ = 4                       ///! Stages of the pipelined mainloop
 >
-class SwizzleDequantTest {
+class NarrowDequantTest {
  public:
   using QuantBlocking = QuantBlocking_;
   using WarpShape = WarpShape_;
   static constexpr int kSplitK = SplitKSerial_;
   static constexpr int kStages = Stages_;
 
-  using TestKernel = SwizzleDequantTestKernel<QuantBlocking, false, WarpShape, kSplitK, kStages>;
+  using TestKernel = NarrowDequantTestKernel<QuantBlocking, false, WarpShape, kSplitK, kStages>;
   using Args = typename TestKernel::Params;
 
   cutlass::Status run(
@@ -511,13 +511,13 @@ class SwizzleDequantTest {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename QuantBlocking, typename WarpShape, int kSplitK, int kStages>
-void test_swizzle_dequant(int m, int n, int k) {
+void test_narrow_dequant(int m, int n, int k) {
   std::cout << "Testing Blocking: " << QuantBlocking::kRow << "x" << QuantBlocking::kColumn 
             << " WarpShape: " << WarpShape::kM << "x" << WarpShape::kN << "x" << WarpShape::kK
             << ", kSplitK: " << kSplitK << ", kStages: " << kStages;
   std::cout << ", m: " << m << ", n: " << n << ", k: " << k << std::endl;
 
-  using Test = SwizzleDequantTest<QuantBlocking, WarpShape, kSplitK, kStages>;
+  using Test = NarrowDequantTest<QuantBlocking, WarpShape, kSplitK, kStages>;
   Test test;
   cutlass::gemm::GemmCoord problem_size(m, n, k);
 
@@ -598,7 +598,7 @@ void test_swizzle_dequant(int m, int n, int k) {
   cudaDeviceSynchronize();
   bool passed = cutlass::reference::host::TensorEquals(dst.host_view(), tensor_b.host_view());
   if (!passed) {
-    std::cerr << "Mismatch found in test_swizzle_dequant!" << std::endl;
+    std::cerr << "Mismatch found in test_narrow_dequant!" << std::endl;
     std::cerr << "Expected:" << std::endl;
     std::cerr << dst.host_view() << std::endl;
     std::cerr << "Actual:" << std::endl;
@@ -607,18 +607,18 @@ void test_swizzle_dequant(int m, int n, int k) {
   ASSERT_TRUE(passed);
 }
 
-TEST(SwizzleDequant, PackedBTest) {
-  // test_swizzle_dequant<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 32, 64);
+TEST(NarrowDequant, PackedBTest) {
+  // test_narrow_dequant<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 32, 64);
 
-  test_swizzle_dequant<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
-  test_swizzle_dequant<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
-  test_swizzle_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
-  test_swizzle_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
+  test_narrow_dequant<cutlass::MatrixShape<1, 16>, cutlass::gemm::GemmShape<1, 16, 64>, 1, 4>(1, 48, 1024 + 16);
+  test_narrow_dequant<cutlass::MatrixShape<16, 1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 16);
+  test_narrow_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 16, 64>, 2, 3>(1, 48, 1024 + 128);
+  test_narrow_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 16, 64>, 4, 4>(1, 128, 4096 + 16);
 
-  test_swizzle_dequant<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
-  test_swizzle_dequant<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
-  test_swizzle_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
-  test_swizzle_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
+  test_narrow_dequant<cutlass::MatrixShape<1, 32>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 32 * 3, 1024 + 16);
+  test_narrow_dequant<cutlass::MatrixShape<32, 1>, cutlass::gemm::GemmShape<1, 32, 32>, 1, 4>(1, 48, 1024 + 32);
+  test_narrow_dequant<cutlass::MatrixShape<128,1>, cutlass::gemm::GemmShape<1, 32, 32>, 2, 3>(1, 48, 1024 + 128);
+  test_narrow_dequant<cutlass::MatrixShape<1, 64>, cutlass::gemm::GemmShape<1, 32, 32>, 4, 4>(1, 128, 4096 + 16);
 }
 
 } // namespace test
